@@ -127,6 +127,64 @@ func TestGeminiAntigravityBuildArgs(t *testing.T) {
 	}
 }
 
+func TestGeminiWithSessionIDPreservesCloneSemantics(t *testing.T) {
+	a := NewGeminiAgent("gemini").WithModel("gemini-1.5-pro").WithReasoning(ReasoningThorough).WithAgentic(true).(*GeminiAgent)
+	assert.Empty(t, a.SessionID)
+
+	a2 := a.WithSessionID("session-123").(*GeminiAgent)
+	assert.Equal(t, "session-123", a2.SessionID)
+	assert.Equal(t, "gemini-1.5-pro", a2.Model)
+	assert.Equal(t, ReasoningThorough, a2.Reasoning)
+	assert.True(t, a2.Agentic)
+	assert.Empty(t, a.SessionID, "original agent session ID must remain empty")
+}
+
+func TestGeminiBuildArgsWithSessionResume(t *testing.T) {
+	t.Run("GeminiCLIValidResume", func(t *testing.T) {
+		a := NewGeminiAgent("gemini").WithSessionID("session-123").(*GeminiAgent)
+		args := a.buildArgs(false)
+		assertFlagValue(t, args, "--resume", "session-123")
+	})
+
+	t.Run("GeminiCLIRejectsBadSessionFlag", func(t *testing.T) {
+		a := NewGeminiAgent("gemini").WithSessionID("-bad-session").(*GeminiAgent)
+		args := a.buildArgs(false)
+		assert.NotContains(t, args, "--resume")
+		assert.NotContains(t, args, "-bad-session")
+	})
+
+	t.Run("AntigravityValidConversation", func(t *testing.T) {
+		a := NewGeminiAgent("agy").WithSessionID("conv-123").(*GeminiAgent)
+		args := a.buildArgs(false)
+		assertFlagValue(t, args, "--conversation", "conv-123")
+	})
+
+	t.Run("AntigravityRejectsBadSessionFlag", func(t *testing.T) {
+		a := NewGeminiAgent("agy").WithSessionID("-bad-session").(*GeminiAgent)
+		args := a.buildArgs(false)
+		assert.NotContains(t, args, "--conversation")
+		assert.NotContains(t, args, "-bad-session")
+	})
+}
+
+func TestGeminiPlanningCommandLineStripsSessionID(t *testing.T) {
+	t.Run("GeminiCLI", func(t *testing.T) {
+		a := NewGeminiAgent("gemini").WithSessionID("session-123").WithAgentic(true).(*GeminiAgent)
+		cmd := a.PlanningCommandLine()
+		assert.NotContains(t, cmd, "session-123")
+		assert.NotContains(t, cmd, "--resume")
+		assert.Contains(t, cmd, "--approval-mode plan")
+	})
+
+	t.Run("AntigravityCLI", func(t *testing.T) {
+		a := NewGeminiAgent("agy").WithSessionID("conv-123").WithAgentic(true).(*GeminiAgent)
+		cmd := a.PlanningCommandLine()
+		assert.NotContains(t, cmd, "conv-123")
+		assert.NotContains(t, cmd, "--conversation")
+		assert.NotContains(t, cmd, "--dangerously-skip-permissions")
+	})
+}
+
 func TestGeminiAntigravityReviewMergesSettingsAndOmitsYolo(t *testing.T) {
 	skipIfWindows(t)
 
@@ -408,6 +466,87 @@ No issues found in the code.
 			}
 		})
 	}
+}
+
+func TestGeminiAntigravityStreamJSONSessionCapture(t *testing.T) {
+	skipIfWindows(t)
+
+	scriptPath := writeTempCommand(t, `#!/bin/sh
+if [ "$1" = "--version" ]; then echo "1.1.1"; exit 0; fi
+printf '%s\n' "$@" > "$ARGS_FILE"
+echo '{"event":"init","conversation_id":"agy-sess-456"}'
+echo '{"event":"result","conversation_id":"agy-sess-456","response":"Antigravity review passed"}'
+`)
+	argsFile := filepath.Join(t.TempDir(), "args")
+	t.Setenv("ARGS_FILE", argsFile)
+	a := NewGeminiAgent(scriptPath)
+	a.Command = filepath.Join(filepath.Dir(scriptPath), "agy")
+	require.NoError(t, os.Rename(scriptPath, a.Command))
+
+	var output bytes.Buffer
+	capture := NewSessionCaptureWriter(&output, nil)
+	res, err := a.Review(t.Context(), t.TempDir(), "sha", "prompt", capture)
+	require.NoError(t, err)
+	assert.Equal(t, "Antigravity review passed", res)
+	assert.Equal(t, "agy-sess-456", capture.SessionID())
+
+	argsBytes, readErr := os.ReadFile(argsFile)
+	require.NoError(t, readErr)
+	args := strings.Split(strings.TrimSpace(string(argsBytes)), "\n")
+	assertFlagValue(t, args, "--output-format", "stream-json")
+}
+
+func TestGeminiAntigravityStreamJSONAssistantFallback(t *testing.T) {
+	skipIfWindows(t)
+
+	scriptPath := writeTempCommand(t, `#!/bin/sh
+if [ "$1" = "--version" ]; then echo "1.1.1"; exit 0; fi
+printf '%s\n' "$@" > "$ARGS_FILE"
+echo '{"event":"init","conversation_id":"agy-sess-999"}'
+echo '{"event":"step_update","text":"Running analysis"}'
+echo '{"type":"message","role":"assistant","content":"Assistant review message"}'
+`)
+	argsFile := filepath.Join(t.TempDir(), "args")
+	t.Setenv("ARGS_FILE", argsFile)
+	a := NewGeminiAgent(scriptPath)
+	a.Command = filepath.Join(filepath.Dir(scriptPath), "agy")
+	require.NoError(t, os.Rename(scriptPath, a.Command))
+
+	var output bytes.Buffer
+	capture := NewSessionCaptureWriter(&output, nil)
+	res, err := a.Review(t.Context(), t.TempDir(), "sha", "prompt", capture)
+	require.NoError(t, err)
+	assert.Equal(t, "Running analysis\nAssistant review message", res)
+	assert.Equal(t, "agy-sess-999", capture.SessionID())
+}
+
+func TestGeminiAntigravityResumeSessionPassesConversationFlag(t *testing.T) {
+	skipIfWindows(t)
+
+	scriptPath := writeTempCommand(t, `#!/bin/sh
+if [ "$1" = "--version" ]; then echo "1.1.1"; exit 0; fi
+printf '%s\n' "$@" > "$ARGS_FILE"
+echo '{"event":"init","conversation_id":"resumed-conv-789"}'
+echo '{"event":"result","conversation_id":"resumed-conv-789","response":"Resumed review passed"}'
+`)
+	argsFile := filepath.Join(t.TempDir(), "args")
+	t.Setenv("ARGS_FILE", argsFile)
+	a := NewGeminiAgent(scriptPath).WithSessionID("resumed-conv-789").(*GeminiAgent)
+	a.Command = filepath.Join(filepath.Dir(scriptPath), "agy")
+	require.NoError(t, os.Rename(scriptPath, a.Command))
+
+	var output bytes.Buffer
+	capture := NewSessionCaptureWriter(&output, nil)
+	res, err := a.Review(t.Context(), t.TempDir(), "sha", "prompt", capture)
+	require.NoError(t, err)
+	assert.Equal(t, "Resumed review passed", res)
+	assert.Equal(t, "resumed-conv-789", capture.SessionID())
+
+	argsBytes, readErr := os.ReadFile(argsFile)
+	require.NoError(t, readErr)
+	args := strings.Split(strings.TrimSpace(string(argsBytes)), "\n")
+	assertFlagValue(t, args, "--output-format", "stream-json")
+	assertFlagValue(t, args, "--conversation", "resumed-conv-789")
 }
 
 func TestGeminiAntigravityReviewPlainText(t *testing.T) {

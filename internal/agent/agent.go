@@ -160,6 +160,13 @@ type SessionAgent interface {
 	WithSessionID(sessionID string) Agent
 }
 
+// IsValidResumeSessionID reports whether sessionID is a non-empty session identifier
+// suitable for CLI resume flags, rejecting empty strings and leading '-' flags.
+func IsValidResumeSessionID(sessionID string) bool {
+	trimmed := strings.TrimSpace(sessionID)
+	return trimmed != "" && !strings.HasPrefix(trimmed, "-")
+}
+
 // SupportsSessionResume reports whether the registered agent can consume a
 // prior session ID. Unknown agents are not resumable.
 func SupportsSessionResume(name string) bool {

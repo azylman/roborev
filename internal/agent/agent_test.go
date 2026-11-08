@@ -594,11 +594,51 @@ func TestSessionAgentsPreserveStateAcrossCloneMethods(t *testing.T) {
 				assert.True(t, grok.Agentic)
 			},
 		},
+		{
+			name: "gemini",
+			agent: NewGeminiAgent("gemini").
+				WithSessionID("session-123").
+				WithModel("gemini-1.5-pro").
+				WithReasoning(ReasoningThorough).
+				WithAgentic(true),
+			verify: func(t *testing.T, a Agent) {
+				gemini, ok := a.(*GeminiAgent)
+				require.True(t, ok)
+				assert.Equal(t, "session-123", gemini.SessionID)
+				assert.Equal(t, "gemini-1.5-pro", gemini.Model)
+				assert.Equal(t, ReasoningThorough, gemini.Reasoning)
+				assert.True(t, gemini.Agentic)
+			},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			tt.verify(t, tt.agent)
+		})
+	}
+}
+
+func TestIsValidResumeSessionID(t *testing.T) {
+	tests := []struct {
+		name      string
+		sessionID string
+		want      bool
+	}{
+		{"empty string", "", false},
+		{"whitespace only", "   ", false},
+		{"leading dash single", "-bad-session", false},
+		{"leading dash double", "--resume", false},
+		{"leading dash short flag", "-s", false},
+		{"whitespace then dash", "  -bad", false},
+		{"valid session id", "session-123", true},
+		{"valid uuid", "c8d0e51e-e218-4a57-bb03-b09e13d982b6", true},
+		{"valid with whitespace padding", "  session-456  ", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, IsValidResumeSessionID(tt.sessionID))
 		})
 	}
 }

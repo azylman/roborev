@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"errors"
 	"fmt"
@@ -33,7 +34,10 @@ type GeminiAgent struct {
 	CommandAuto   bool           // Whether Command was selected from compatible command candidates
 	Reasoning     ReasoningLevel // Reasoning level (for future support)
 	Agentic       bool           // Whether agentic mode is enabled (allow file edits)
+	SessionID     string         // Existing session ID to resume
 }
+
+var _ SessionAgent = (*GeminiAgent)(nil)
 
 // NewGeminiAgent creates a new Gemini agent
 func NewGeminiAgent(command string) *GeminiAgent {
@@ -49,7 +53,7 @@ func (a *GeminiAgent) clone(opts ...agentCloneOption) *GeminiAgent {
 		a.Model,
 		a.Reasoning,
 		a.Agentic,
-		"",
+		a.SessionID,
 		opts...,
 	)
 	return &GeminiAgent{
@@ -59,6 +63,7 @@ func (a *GeminiAgent) clone(opts ...agentCloneOption) *GeminiAgent {
 		CommandAuto:   a.CommandAuto,
 		Reasoning:     cfg.Reasoning,
 		Agentic:       cfg.Agentic,
+		SessionID:     cfg.SessionID,
 	}
 }
 
@@ -80,6 +85,11 @@ func (a *GeminiAgent) WithModel(model string) Agent {
 	clone := a.clone(withClonedModel(model))
 	clone.ModelExplicit = true
 	return clone
+}
+
+// WithSessionID returns a copy of the agent configured to resume a prior session.
+func (a *GeminiAgent) WithSessionID(sessionID string) Agent {
+	return a.clone(withClonedSessionID(sessionID))
 }
 
 func (a *GeminiAgent) Name() string {
@@ -104,7 +114,7 @@ func (a *GeminiAgent) CommandLine() string {
 
 // PlanningCommandLine returns Gemini's representative read-only planning command.
 func (a *GeminiAgent) PlanningCommandLine() string {
-	return a.commandLine(false)
+	return a.WithSessionID("").(*GeminiAgent).commandLine(false)
 }
 
 func (a *GeminiAgent) commandLine(agenticMode bool) string {
@@ -156,6 +166,10 @@ func (a *GeminiAgent) buildArgsWithModel(model string, agenticMode bool) []strin
 		args = append(args, "--approval-mode", "plan")
 	}
 
+	if IsValidResumeSessionID(a.SessionID) {
+		args = append(args, "--resume", a.SessionID)
+	}
+
 	return args
 }
 
@@ -182,6 +196,10 @@ func (a *GeminiAgent) buildAntigravityArgs(agenticMode bool) []string {
 	// Non-agentic print-mode reviews omit --sandbox: agy's sandbox permission
 	// gate rejects `pwd` (and similar read-only workspace probes) in headless
 	// print mode. Reviews still do not get --dangerously-skip-permissions.
+
+	if IsValidResumeSessionID(a.SessionID) {
+		args = append(args, "--conversation", a.SessionID)
+	}
 
 	return args
 }
@@ -272,6 +290,7 @@ func (a *GeminiAgent) runAntigravity(ctx context.Context, repoPath, prompt strin
 	var finalArgs []string
 	var stdin io.Reader
 	if antigravityPromptViaFlag(ctx, a.Command) {
+		args = append([]string{"--output-format", "stream-json"}, args...)
 		if size, limit := antigravityPromptArgSize(trimmedPrompt), antigravityMaxPromptArgLen(); size > limit {
 			finalArgs = append([]string(nil), args...)
 			stdin = strings.NewReader(trimmedPrompt + "\n")
@@ -292,7 +311,7 @@ func (a *GeminiAgent) runAntigravity(ctx context.Context, repoPath, prompt strin
 		Output:       output,
 		StreamStderr: true,
 		Parse: func(r io.Reader, sw *syncWriter) (string, error) {
-			return parsePlainTextOutput(r, sw)
+			return parseAntigravityOutput(r, sw)
 		},
 	})
 	if runErr != nil {
@@ -546,6 +565,101 @@ func (a *GeminiAgent) parseStreamJSON(r io.Reader, sw *syncWriter) (parseResult,
 	}
 
 	return parseResult{}, nil
+}
+
+func parseAntigravityOutput(r io.Reader, sw *syncWriter) (string, error) {
+	var lastResult string
+	assistantMessages := newTrailingReviewText()
+	var plainLines []string
+	var jsonEventsParsed bool
+
+	err := scanStreamJSONLines(r, sw, func(trimmed string) error {
+		if !strings.HasPrefix(trimmed, "{") {
+			plainLines = append(plainLines, trimmed)
+			return nil
+		}
+
+		var fields map[string]jsontext.Value
+		if err := json.Unmarshal([]byte(trimmed), &fields); err != nil {
+			plainLines = append(plainLines, trimmed)
+			return nil
+		}
+
+		jsonEventsParsed = true
+
+		evt := jsonFieldString(fields, "event")
+		typ := jsonFieldString(fields, "type")
+
+		if evt == "result" || typ == "result" {
+			if resp := jsonFieldString(fields, "response"); resp != "" {
+				lastResult = resp
+			} else if res := jsonFieldString(fields, "result"); res != "" {
+				lastResult = res
+			}
+			return nil
+		}
+
+		if evt == "tool" || typ == "tool" || evt == "tool_result" || typ == "tool_result" {
+			assistantMessages.ResetAfterTool()
+			return nil
+		}
+
+		if text := extractAssistantEventText(fields, evt, typ); text != "" {
+			assistantMessages.Add(text)
+		}
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+
+	if lastResult != "" {
+		return lastResult, nil
+	}
+	if joined := assistantMessages.Join("\n"); joined != "" {
+		return joined, nil
+	}
+	if !jsonEventsParsed || len(plainLines) > 0 {
+		return strings.TrimSpace(strings.Join(plainLines, "\n")), nil
+	}
+	return "", nil
+}
+
+func extractAssistantEventText(fields map[string]jsontext.Value, evt, typ string) string {
+	if role := jsonFieldString(fields, "role"); role != "" && role != "assistant" {
+		return ""
+	}
+
+	isAssistantEvent := evt == "message" || typ == "message" ||
+		evt == "assistant" || typ == "assistant" ||
+		evt == "step_update" || typ == "step_update"
+
+	if isAssistantEvent {
+		for _, key := range []string{"response", "text", "content"} {
+			if s := jsonFieldString(fields, key); s != "" {
+				return s
+			}
+		}
+	}
+
+	for _, key := range []string{"message", "assistant", "step_update"} {
+		if raw, ok := fields[key]; ok {
+			var s string
+			if err := json.Unmarshal(raw, &s); err == nil && strings.TrimSpace(s) != "" {
+				return strings.TrimSpace(s)
+			}
+			var nested map[string]jsontext.Value
+			if err := json.Unmarshal(raw, &nested); err == nil {
+				for _, subKey := range []string{"content", "text", "description", "response"} {
+					if sub := jsonFieldString(nested, subKey); sub != "" {
+						return sub
+					}
+				}
+			}
+		}
+	}
+
+	return ""
 }
 
 func init() {
