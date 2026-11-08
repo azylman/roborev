@@ -1,8 +1,9 @@
 package agent
 
 import (
-	"context"
 	"bytes"
+	"context"
+	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"errors"
 	"fmt"
@@ -497,11 +498,24 @@ func isModelNotFoundError(stderr string) bool {
 			strings.Contains(lower, "not_found"))
 }
 
+type geminiStepUpdate struct {
+	StepIndex *int   `json:"step_index,omitempty"`
+	Type      string `json:"type,omitempty"`
+	StepType  string `json:"step_type,omitempty"`
+	ToolName  string `json:"tool_name,omitempty"`
+	Content   string `json:"content,omitempty"`
+	Text      string `json:"text,omitempty"`
+	TextDelta string `json:"text_delta,omitempty"`
+	Delta     string `json:"delta,omitempty"`
+	ToolCalls []any  `json:"tool_calls,omitempty"`
+}
+
 // geminiStreamMessage represents a message in Gemini's stream-json output format
 type geminiStreamMessage struct {
-	Type    string `json:"type"`
-	Event   string `json:"event,omitempty"`
-	Subtype string `json:"subtype,omitempty"`
+	Type      string `json:"type"`
+	Event     string `json:"event,omitempty"`
+	Subtype   string `json:"subtype,omitempty"`
+	StepIndex *int   `json:"step_index,omitempty"`
 	// Top-level fields for "message" type events
 	Role    string `json:"role,omitempty"`
 	Content string `json:"content,omitempty"`
@@ -511,9 +525,50 @@ type geminiStreamMessage struct {
 	Message struct {
 		Content string `json:"content,omitempty"`
 	} `json:"message,omitempty"`
-	// Result/response fields for "result" events
-	Result   string `json:"result,omitempty"`
-	Response string `json:"response,omitempty"`
+	// Antigravity step_update and tool_call fields
+	StepUpdate geminiStepUpdate `json:"step_update,omitempty"`
+	ToolCall   map[string]any   `json:"tool_call,omitempty"`
+	// Result/response fields for "result" events (string or nested object)
+	Result   jsontext.Value `json:"result,omitempty"`
+	Response string         `json:"response,omitempty"`
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func isGeminiStepTool(msg geminiStreamMessage) bool {
+	typ := strings.ToLower(firstNonEmptyString(msg.StepUpdate.Type, msg.StepUpdate.StepType))
+	return typ == "tool_call" || typ == "tool" || typ == "subagent" ||
+		msg.StepUpdate.ToolName != "" || len(msg.StepUpdate.ToolCalls) > 0 || len(msg.ToolCall) > 0
+}
+
+func extractGeminiResultText(msg geminiStreamMessage) string {
+	if msg.Response != "" {
+		return msg.Response
+	}
+	if len(msg.Result) == 0 {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(msg.Result, &s); err == nil && s != "" {
+		return s
+	}
+	var nested struct {
+		Response string `json:"response"`
+		Result   string `json:"result"`
+		Content  string `json:"content"`
+		Text     string `json:"text"`
+	}
+	if err := json.Unmarshal(msg.Result, &nested); err == nil {
+		return firstNonEmptyString(nested.Response, nested.Result, nested.Content, nested.Text)
+	}
+	return ""
 }
 
 // parseResult contains the parsed result from stream-json output
@@ -540,18 +595,30 @@ func (a *GeminiAgent) parseStreamJSON(r io.Reader, sw *syncWriter) (parseResult,
 			if (msg.Type == "assistant" || msg.Event == "assistant") && msg.Message.Content != "" {
 				assistantMessages.Add(msg.Message.Content)
 			}
-			if (msg.Type == "step_update" || msg.Event == "step_update") && msg.Text != "" {
-				assistantMessages.Add(msg.Text)
+			if msg.Type == "step_update" || msg.Event == "step_update" {
+				if isGeminiStepTool(msg) {
+					assistantMessages.ResetAfterTool()
+				} else {
+					stepID := ""
+					if msg.StepUpdate.StepIndex != nil {
+						stepID = strconv.Itoa(*msg.StepUpdate.StepIndex)
+					} else if msg.StepIndex != nil {
+						stepID = strconv.Itoa(*msg.StepIndex)
+					}
+					if text := firstNonEmptyString(msg.StepUpdate.Content, msg.StepUpdate.Text, msg.Text, msg.Content); text != "" {
+						assistantMessages.AddWithID(stepID, text)
+					} else if delta := firstNonEmptyString(msg.StepUpdate.TextDelta, msg.StepUpdate.Delta); delta != "" {
+						assistantMessages.Add(delta)
+					}
+				}
 			}
 			if msg.Type == "tool" || msg.Event == "tool" || msg.Type == "tool_result" || msg.Event == "tool_result" {
 				assistantMessages.ResetAfterTool()
 			}
 
 			if msg.Type == "result" || msg.Event == "result" {
-				if msg.Response != "" {
-					lastResult = msg.Response
-				} else if msg.Result != "" {
-					lastResult = msg.Result
+				if res := extractGeminiResultText(msg); res != "" {
+					lastResult = res
 				}
 			}
 		}

@@ -355,6 +355,29 @@ func TestGeminiParseStreamJSON(t *testing.T) {
 			},
 		},
 		{
+			name: "AntigravityNestedResultObject",
+			input: `{"event":"init","session_id":"agy-sess-123"}
+{"event":"step_update","step_update":{"step_index":1,"type":"planner_response","text_delta":"No issues ","content":"No issues "}}
+{"event":"step_update","step_update":{"step_index":1,"type":"planner_response","text_delta":"found.","content":"No issues found."}}
+{"event":"result","result":{"status":"SUCCESS","response":"No issues found."}}
+`,
+			assertResult: func(t *testing.T, res string) {
+				assert.Equal(t, "No issues found.", res)
+			},
+		},
+		{
+			name: "AntigravityNestedStepUpdateFallback",
+			input: `{"event":"init","session_id":"agy-sess-123"}
+{"event":"step_update","step_update":{"step_index":1,"type":"planner_response","content":"Inspecting files..."}}
+{"event":"step_update","step_update":{"step_index":2,"type":"tool_call","tool_name":"read_file"}}
+{"event":"step_update","step_update":{"step_index":3,"type":"planner_response","text_delta":"Final ","content":"Final "}}
+{"event":"step_update","step_update":{"step_index":3,"type":"planner_response","text_delta":"review.","content":"Final review."}}
+`,
+			assertResult: func(t *testing.T, res string) {
+				assert.Equal(t, "Final review.", res)
+			},
+		},
+		{
 			name: "GeminiMessageFormat",
 			input: `{"type":"message","timestamp":"2026-01-19T17:49:13.445Z","role":"assistant","content":"Changes:\n- Created file.ts","delta":true}
 {"type":"message","timestamp":"2026-01-19T17:49:13.447Z","role":"assistant","content":" with filtering logic.","delta":true}
@@ -475,7 +498,7 @@ func TestGeminiAntigravityStreamJSONSessionCapture(t *testing.T) {
 if [ "$1" = "--version" ]; then echo "1.1.1"; exit 0; fi
 printf '%s\n' "$@" > "$ARGS_FILE"
 echo '{"event":"init","conversation_id":"agy-sess-456"}'
-echo '{"event":"result","conversation_id":"agy-sess-456","response":"Antigravity review passed"}'
+echo '{"event":"result","conversation_id":"agy-sess-456","result":{"status":"SUCCESS","response":"Antigravity review passed"}}'
 `)
 	argsFile := filepath.Join(t.TempDir(), "args")
 	t.Setenv("ARGS_FILE", argsFile)
