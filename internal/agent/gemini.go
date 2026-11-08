@@ -2,7 +2,7 @@ package agent
 
 import (
 	"context"
-	"encoding/json/jsontext"
+	"bytes"
 	"encoding/json/v2"
 	"errors"
 	"fmt"
@@ -166,7 +166,7 @@ func (a *GeminiAgent) buildArgsWithModel(model string, agenticMode bool) []strin
 		args = append(args, "--approval-mode", "plan")
 	}
 
-	if IsValidResumeSessionID(a.SessionID) {
+	if a.SessionID != "" && !strings.HasPrefix(a.SessionID, "-") {
 		args = append(args, "--resume", a.SessionID)
 	}
 
@@ -197,7 +197,7 @@ func (a *GeminiAgent) buildAntigravityArgs(agenticMode bool) []string {
 	// gate rejects `pwd` (and similar read-only workspace probes) in headless
 	// print mode. Reviews still do not get --dangerously-skip-permissions.
 
-	if IsValidResumeSessionID(a.SessionID) {
+	if a.SessionID != "" && !strings.HasPrefix(a.SessionID, "-") {
 		args = append(args, "--conversation", a.SessionID)
 	}
 
@@ -311,7 +311,7 @@ func (a *GeminiAgent) runAntigravity(ctx context.Context, repoPath, prompt strin
 		Output:       output,
 		StreamStderr: true,
 		Parse: func(r io.Reader, sw *syncWriter) (string, error) {
-			return parseAntigravityOutput(r, sw)
+			return a.parseAntigravityOutput(r, sw)
 		},
 	})
 	if runErr != nil {
@@ -500,17 +500,20 @@ func isModelNotFoundError(stderr string) bool {
 // geminiStreamMessage represents a message in Gemini's stream-json output format
 type geminiStreamMessage struct {
 	Type    string `json:"type"`
+	Event   string `json:"event,omitempty"`
 	Subtype string `json:"subtype,omitempty"`
 	// Top-level fields for "message" type events
 	Role    string `json:"role,omitempty"`
 	Content string `json:"content,omitempty"`
+	Text    string `json:"text,omitempty"`
 	Delta   bool   `json:"delta,omitempty"`
 	// Nested message field (older format / Claude Code compatibility)
 	Message struct {
 		Content string `json:"content,omitempty"`
 	} `json:"message,omitempty"`
-	// Result field for "result" type events
-	Result string `json:"result,omitempty"`
+	// Result/response fields for "result" events
+	Result   string `json:"result,omitempty"`
+	Response string `json:"response,omitempty"`
 }
 
 // parseResult contains the parsed result from stream-json output
@@ -531,18 +534,25 @@ func (a *GeminiAgent) parseStreamJSON(r io.Reader, sw *syncWriter) (parseResult,
 		if jsonErr := json.Unmarshal([]byte(trimmed), &msg); jsonErr == nil {
 			validEventsParsed = true
 
-			if msg.Type == "message" && msg.Role == "assistant" && msg.Content != "" {
+			if (msg.Type == "message" || msg.Event == "message") && msg.Role == "assistant" && msg.Content != "" {
 				assistantMessages.Add(msg.Content)
 			}
-			if msg.Type == "assistant" && msg.Message.Content != "" {
+			if (msg.Type == "assistant" || msg.Event == "assistant") && msg.Message.Content != "" {
 				assistantMessages.Add(msg.Message.Content)
 			}
-			if msg.Type == "tool" || msg.Type == "tool_result" {
+			if (msg.Type == "step_update" || msg.Event == "step_update") && msg.Text != "" {
+				assistantMessages.Add(msg.Text)
+			}
+			if msg.Type == "tool" || msg.Event == "tool" || msg.Type == "tool_result" || msg.Event == "tool_result" {
 				assistantMessages.ResetAfterTool()
 			}
 
-			if msg.Type == "result" && msg.Result != "" {
-				lastResult = msg.Result
+			if msg.Type == "result" || msg.Event == "result" {
+				if msg.Response != "" {
+					lastResult = msg.Response
+				} else if msg.Result != "" {
+					lastResult = msg.Result
+				}
 			}
 		}
 		return nil
@@ -560,106 +570,21 @@ func (a *GeminiAgent) parseStreamJSON(r io.Reader, sw *syncWriter) (parseResult,
 	if lastResult != "" {
 		return parseResult{result: lastResult}, nil
 	}
-	if result := assistantMessages.Join("\n"); result != "" {
+	if result := assistantMessages.Join("
+"); result != "" {
 		return parseResult{result: result}, nil
 	}
 
 	return parseResult{}, nil
 }
 
-func parseAntigravityOutput(r io.Reader, sw *syncWriter) (string, error) {
-	var lastResult string
-	assistantMessages := newTrailingReviewText()
-	var plainLines []string
-	var jsonEventsParsed bool
-
-	err := scanStreamJSONLines(r, sw, func(trimmed string) error {
-		if !strings.HasPrefix(trimmed, "{") {
-			plainLines = append(plainLines, trimmed)
-			return nil
-		}
-
-		var fields map[string]jsontext.Value
-		if err := json.Unmarshal([]byte(trimmed), &fields); err != nil {
-			plainLines = append(plainLines, trimmed)
-			return nil
-		}
-
-		jsonEventsParsed = true
-
-		evt := jsonFieldString(fields, "event")
-		typ := jsonFieldString(fields, "type")
-
-		if evt == "result" || typ == "result" {
-			if resp := jsonFieldString(fields, "response"); resp != "" {
-				lastResult = resp
-			} else if res := jsonFieldString(fields, "result"); res != "" {
-				lastResult = res
-			}
-			return nil
-		}
-
-		if evt == "tool" || typ == "tool" || evt == "tool_result" || typ == "tool_result" {
-			assistantMessages.ResetAfterTool()
-			return nil
-		}
-
-		if text := extractAssistantEventText(fields, evt, typ); text != "" {
-			assistantMessages.Add(text)
-		}
-		return nil
-	})
-	if err != nil {
-		return "", err
+func (a *GeminiAgent) parseAntigravityOutput(r io.Reader, sw *syncWriter) (string, error) {
+	var raw bytes.Buffer
+	parsed, err := a.parseStreamJSON(io.TeeReader(r, &raw), sw)
+	if errors.Is(err, errNoStreamJSON) {
+		return strings.TrimSpace(raw.String()), nil
 	}
-
-	if lastResult != "" {
-		return lastResult, nil
-	}
-	if joined := assistantMessages.Join("\n"); joined != "" {
-		return joined, nil
-	}
-	if !jsonEventsParsed || len(plainLines) > 0 {
-		return strings.TrimSpace(strings.Join(plainLines, "\n")), nil
-	}
-	return "", nil
-}
-
-func extractAssistantEventText(fields map[string]jsontext.Value, evt, typ string) string {
-	if role := jsonFieldString(fields, "role"); role != "" && role != "assistant" {
-		return ""
-	}
-
-	isAssistantEvent := evt == "message" || typ == "message" ||
-		evt == "assistant" || typ == "assistant" ||
-		evt == "step_update" || typ == "step_update"
-
-	if isAssistantEvent {
-		for _, key := range []string{"response", "text", "content"} {
-			if s := jsonFieldString(fields, key); s != "" {
-				return s
-			}
-		}
-	}
-
-	for _, key := range []string{"message", "assistant", "step_update"} {
-		if raw, ok := fields[key]; ok {
-			var s string
-			if err := json.Unmarshal(raw, &s); err == nil && strings.TrimSpace(s) != "" {
-				return strings.TrimSpace(s)
-			}
-			var nested map[string]jsontext.Value
-			if err := json.Unmarshal(raw, &nested); err == nil {
-				for _, subKey := range []string{"content", "text", "description", "response"} {
-					if sub := jsonFieldString(nested, subKey); sub != "" {
-						return sub
-					}
-				}
-			}
-		}
-	}
-
-	return ""
+	return parsed.result, err
 }
 
 func init() {

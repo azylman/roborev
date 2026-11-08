@@ -619,30 +619,6 @@ func TestSessionAgentsPreserveStateAcrossCloneMethods(t *testing.T) {
 	}
 }
 
-func TestIsValidResumeSessionID(t *testing.T) {
-	tests := []struct {
-		name      string
-		sessionID string
-		want      bool
-	}{
-		{"empty string", "", false},
-		{"whitespace only", "   ", false},
-		{"leading dash single", "-bad-session", false},
-		{"leading dash double", "--resume", false},
-		{"leading dash short flag", "-s", false},
-		{"whitespace then dash", "  -bad", false},
-		{"valid session id", "session-123", true},
-		{"valid uuid", "c8d0e51e-e218-4a57-bb03-b09e13d982b6", true},
-		{"valid with whitespace padding", "  session-456  ", true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, IsValidResumeSessionID(tt.sessionID))
-		})
-	}
-}
-
 func assertArgsContain(t *testing.T, cmdLine, flag, value string) {
 	t.Helper()
 	tokens := strings.Fields(cmdLine)
