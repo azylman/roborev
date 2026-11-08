@@ -570,8 +570,7 @@ func (a *GeminiAgent) parseStreamJSON(r io.Reader, sw *syncWriter) (parseResult,
 	if lastResult != "" {
 		return parseResult{result: lastResult}, nil
 	}
-	if result := assistantMessages.Join("
-"); result != "" {
+	if result := assistantMessages.Join("\n"); result != "" {
 		return parseResult{result: result}, nil
 	}
 
