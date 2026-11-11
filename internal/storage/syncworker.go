@@ -225,11 +225,12 @@ func (w *SyncWorker) PublishSearchVectors(
 // NewSyncWorker creates a new sync worker
 func NewSyncWorker(db *DB, cfg config.SyncConfig) *SyncWorker {
 	return &SyncWorker{
-		db:     db,
-		cfg:    cfg,
-		stopCh: make(chan struct{}),
-		doneCh: make(chan struct{}),
-		syncMu: semaphore.NewWeighted(1),
+		db:              db,
+		cfg:             cfg,
+		stopCh:          make(chan struct{}),
+		doneCh:          make(chan struct{}),
+		syncMu:          semaphore.NewWeighted(1),
+		skipInitialSync: strings.TrimSpace(os.Getenv(syncBranchEnv)) != "",
 	}
 }
 
@@ -832,6 +833,8 @@ const defaultSyncCursorLookback = 5 * time.Minute
 
 const syncCursorLookbackEnv = "ROBOREV_SYNC_CURSOR_LOOKBACK"
 
+const syncBranchEnv = "ROBOREV_SYNC_BRANCH"
+
 // pushCursor lasts one push pass. Earlier rows that change or fail retry next pass.
 type pushCursor struct {
 	job, reviewJob int64
@@ -1062,6 +1065,25 @@ func (w *SyncWorker) pullChangesWithStats(ctx context.Context, pool *PgPool) (pu
 	if err != nil {
 		return stats, fmt.Errorf("get job cursor: %w", err)
 	}
+	if jobCursor == "" {
+		if branch := strings.TrimSpace(os.Getenv(syncBranchEnv)); branch != "" {
+			seedJob, seedReview, seedResp, err := pool.SeedBranchCursors(ctx, branch)
+			if err != nil {
+				return stats, fmt.Errorf("seed branch cursors: %w", &syncSourceError{err})
+			}
+			for _, kv := range [][2]string{
+				{SyncStateSetupFinished, "1"},
+				{SyncStateLastJobCursor, seedJob},
+				{SyncStateLastReviewCursor, seedReview},
+				{SyncStateLastResponseID, seedResp},
+			} {
+				if err := w.db.SetSyncState(kv[0], kv[1]); err != nil {
+					return stats, fmt.Errorf("save seeded sync state %s: %w", kv[0], err)
+				}
+			}
+			jobCursor = seedJob
+		}
+	}
 	jobQueryCursor := rewindTimestampIDCursor(jobCursor, syncCursorLookback())
 	maxJobCursor := jobCursor
 
@@ -1248,6 +1270,9 @@ func rewindTimestampIDCursor(cursor string, lookback time.Duration) string {
 func syncCursorLookback() time.Duration {
 	raw := os.Getenv(syncCursorLookbackEnv)
 	if raw == "" {
+		if strings.TrimSpace(os.Getenv(syncBranchEnv)) != "" {
+			return 0
+		}
 		return defaultSyncCursorLookback
 	}
 	lookback, err := time.ParseDuration(raw)

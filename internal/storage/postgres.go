@@ -1517,6 +1517,26 @@ func (p *PgPool) PullResponses(ctx context.Context, excludeMachineID uuid.UUID, 
 	return responses, newCursor, nil
 }
 
+// SeedBranchCursors returns initial (jobCursor, reviewCursor, responseCursor)
+// positioned 1 minute before the earliest row for branch (or NOW() when branch
+// has no rows yet) so ephemeral CI workers only pull history for the active branch.
+func (p *PgPool) SeedBranchCursors(ctx context.Context, branch string) (string, string, string, error) {
+	var jobTS, reviewTS, respTS time.Time
+	err := p.pool.QueryRow(ctx, `
+		SELECT
+			COALESCE((SELECT MIN(updated_at) - interval '1 minute' FROM review_jobs WHERE branch = $1 AND $1 <> '' AND $1 <> '__none__'), NOW()),
+			COALESCE((SELECT MIN(r.updated_at) - interval '1 minute' FROM reviews r JOIN review_jobs j ON j.uuid = r.job_uuid WHERE j.branch = $1 AND $1 <> '' AND $1 <> '__none__'), NOW()),
+			COALESCE((SELECT MIN(resp.inserted_at) - interval '1 minute' FROM responses resp JOIN review_jobs j ON j.uuid = resp.job_uuid WHERE j.branch = $1 AND $1 <> '' AND $1 <> '__none__'), NOW())
+	`, branch).Scan(&jobTS, &reviewTS, &respTS)
+	if err != nil {
+		return "", "", "", fmt.Errorf("seed branch cursors: %w", err)
+	}
+	return formatTimestampIDCursor(jobTS.UTC(), 0),
+		formatTimestampIDCursor(reviewTS.UTC(), 0),
+		formatTimestampIDCursor(respTS.UTC(), 0),
+		nil
+}
+
 // nullString returns nil if s is empty, otherwise returns s
 func nullString(s string) any {
 	if s == "" {

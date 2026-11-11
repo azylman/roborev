@@ -105,6 +105,20 @@ func (db *DB) GetOrCreateRepo(rootPath string, identity ...string) (*Repo, error
 		return nil, err
 	}
 
+	// If a placeholder repo (root_path == identity) was created during sync
+	// before this single local checkout was opened, claim it in-place so its
+	// synced jobs and commits stay attached to the checkout.
+	if repoIdentity != "" && absPath != repoIdentity {
+		_, err = db.Exec(`
+			UPDATE repos SET root_path = ?, name = ?
+			WHERE root_path = ? AND identity = ?
+			  AND NOT EXISTS (SELECT 1 FROM repos r2 WHERE r2.identity = ? AND r2.root_path != ?)
+		`, absPath, name, repoIdentity, repoIdentity, repoIdentity, repoIdentity)
+		if err != nil {
+			return nil, fmt.Errorf("claim placeholder repo: %w", err)
+		}
+	}
+
 	// Create new — use INSERT OR IGNORE to handle concurrent inserts on the
 	// same root_path (UNIQUE constraint). If the row already exists, re-read it.
 	if repoIdentity != "" {

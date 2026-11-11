@@ -8,6 +8,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"go.kenn.io/roborev/internal/config"
 )
 
 func TestUpsertPulledResponse_MissingParentJob(t *testing.T) {
@@ -72,14 +74,88 @@ func TestUpsertPulledResponse_WithParentJob(t *testing.T) {
 }
 
 func TestSyncCursorLookbackDefaultAndOverride(t *testing.T) { //nolint:paralleltest // t.Setenv of ROBOREV_SYNC_CURSOR_LOOKBACK
+	t.Setenv(syncBranchEnv, "")
 	t.Setenv(syncCursorLookbackEnv, "")
 	assert.Equal(t, defaultSyncCursorLookback, syncCursorLookback())
+
+	t.Setenv(syncBranchEnv, "feat/ephemeral")
+	assert.Equal(t, time.Duration(0), syncCursorLookback())
 
 	t.Setenv(syncCursorLookbackEnv, "30s")
 	assert.Equal(t, 30*time.Second, syncCursorLookback())
 
+	t.Setenv(syncBranchEnv, "")
 	t.Setenv(syncCursorLookbackEnv, "bad")
 	assert.Equal(t, defaultSyncCursorLookback, syncCursorLookback())
+}
+
+func TestSyncBranchEnvSkipsInitialSyncAndAllowsCrossMachineSessionReuse(t *testing.T) { //nolint:paralleltest // t.Setenv of ROBOREV_SYNC_BRANCH
+	db := openTestDB(t)
+	defer db.Close()
+
+	t.Setenv(syncBranchEnv, "feat/test")
+	w := NewSyncWorker(db, config.SyncConfig{Enabled: true})
+	assert.True(t, w.skipInitialSync)
+
+	repoID, err := db.GetOrCreateRepoByIdentity("https://github.com/example/repo.git")
+	require.NoError(t, err)
+	repo, err := db.GetOrCreateRepo(t.TempDir(), "https://github.com/example/repo.git")
+	require.NoError(t, err)
+	assert.Equal(t, repoID, repo.ID)
+
+	remoteMachine := testUUID("remote-pod-machine")
+	localMachine := testUUID("local-pod-machine")
+	jobUUID := testUUID("synced-session-job")
+	now := time.Now().UTC().Truncate(time.Second)
+	require.NoError(t, db.UpsertPulledJob(PulledJob{
+		UUID:            jobUUID,
+		GitRef:          "abc1234..def5678",
+		Branch:          "feat/test",
+		SessionID:       "sess-cross-pod",
+		Agent:           "codex",
+		ReviewType:      "default",
+		Status:          "done",
+		EnqueuedAt:      now,
+		FinishedAt:      &now,
+		SourceMachineID: remoteMachine,
+		UpdatedAt:       now,
+	}, repo.ID, nil))
+	require.NoError(t, db.UpsertPulledReview(PulledReview{
+		UUID:               testUUID("synced-session-review"),
+		JobUUID:            jobUUID,
+		JobEnqueuedAt:      now,
+		JobSourceMachineID: remoteMachine,
+		Agent:              "codex",
+		StructuredOutput:   reviewFixtureJSON("No issues found."),
+		Output:             "No issues found.",
+		UpdatedByMachineID: remoteMachine,
+		CreatedAt:          now,
+		UpdatedAt:          now,
+	}))
+
+	candidates, err := db.FindCompatibleReusableSessionCandidates(ReusableSessionQuery{
+		RepoID:          repo.ID,
+		Branch:          "feat/test",
+		Agent:           "codex",
+		ReviewType:      "default",
+		SourceMachineID: localMachine,
+		Limit:           5,
+	})
+	require.NoError(t, err)
+	require.Len(t, candidates, 1)
+	assert.Equal(t, "sess-cross-pod", candidates[0].SessionID)
+
+	t.Setenv(syncBranchEnv, "")
+	candidatesSameMachineOnly, err := db.FindCompatibleReusableSessionCandidates(ReusableSessionQuery{
+		RepoID:          repo.ID,
+		Branch:          "feat/test",
+		Agent:           "codex",
+		ReviewType:      "default",
+		SourceMachineID: localMachine,
+		Limit:           5,
+	})
+	require.NoError(t, err)
+	assert.Empty(t, candidatesSameMachineOnly)
 }
 
 func TestRewindResponseCursorRewindsTimestampAndResetsLegacyID(t *testing.T) {

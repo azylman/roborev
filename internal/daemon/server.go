@@ -1674,6 +1674,11 @@ func (s *Server) humaListJobs(
 		// no repo filter
 	case 1:
 		repo = repoPaths[0]
+		if strings.TrimSpace(os.Getenv("ROBOREV_SYNC_BRANCH")) != "" {
+			if id := config.ResolveRepoIdentity(repo, nil); id != "" {
+				_, _ = s.db.GetOrCreateRepo(repo, id)
+			}
+		}
 	default:
 		repoPathsFilter = repoPaths
 	}
