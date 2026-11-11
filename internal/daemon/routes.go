@@ -474,6 +474,13 @@ func (s *Server) registerHumaAPI(mux *http.ServeMux) huma.API {
 			o.Tags = []string{"jobs"}
 		})
 
+	huma.Post(api, "/api/panel/synthesize", s.humaStartPanelSynthesis,
+		func(o *huma.Operation) {
+			o.OperationID = "start-panel-synthesis"
+			o.Summary = "Start a held panel's synthesis after its voting members finish"
+			o.Tags = []string{"jobs"}
+		})
+
 	huma.Post(api, "/api/review/migrate", s.humaMigrateReview,
 		func(o *huma.Operation) {
 			o.OperationID = "migrate-review"
@@ -544,6 +551,13 @@ func (s *Server) registerHumaAPI(mux *http.ServeMux) huma.API {
 		func(o *huma.Operation) {
 			o.OperationID = "get-job-output"
 			o.Summary = "Get or stream in-memory job output"
+			o.Tags = []string{"jobs"}
+		})
+
+	huma.Get(api, "/api/job/invocations", s.humaJobInvocations,
+		func(o *huma.Operation) {
+			o.OperationID = "get-job-invocations"
+			o.Summary = "Get locally recorded agent invocations for a supplied review"
 			o.Tags = []string{"jobs"}
 		})
 

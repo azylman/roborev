@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/cenkalti/backoff/v7"
@@ -44,6 +45,10 @@ type Client interface {
 
 	// FindPendingJobForRef finds a queued or running job for any git ref
 	FindPendingJobForRef(ctx context.Context, repoPath, gitRef string) (*storage.ReviewJob, error)
+
+	// FindPostCommitRangeReviewForHead finds a post-commit range review for the
+	// named branch whose range ends at headSHA or HEAD.
+	FindPostCommitRangeReviewForHead(ctx context.Context, repoPath, branch, headSHA string) (*storage.ReviewJob, error)
 
 	// GetCommentsForJob fetches comments for a job
 	GetCommentsForJob(ctx context.Context, jobID int64) ([]storage.Response, error)
@@ -262,7 +267,7 @@ func (c *HTTPClient) FindJobForCommit(ctx context.Context, repoPath, sha string)
 	}
 
 	// Query by git_ref and repo to avoid matching jobs from different repos
-	resp, err := c.apiClient().ListJobsRaw(ctx, &generated.ListJobsRequestOptions{Query: &generated.ListJobsQuery{GitRef: &sha, Repo: []string{normalizedRepo}, Limit: new(int64(1))}})
+	resp, err := c.apiClient().ListJobsRaw(ctx, &generated.ListJobsRequestOptions{Query: &generated.ListJobsQuery{OmitStats: new(generated.ListJobsQueryOmitStatsTrue), GitRef: &sha, Repo: []string{normalizedRepo}, Limit: new(int64(1))}})
 	if err != nil {
 		return nil, err
 	}
@@ -286,7 +291,7 @@ func (c *HTTPClient) FindJobForCommit(ctx context.Context, repoPath, sha string)
 	// Fallback: if repo filter yielded no results, try git_ref only.
 	// This handles worktrees where daemon stores the main repo root path
 	// but the caller uses the worktree path.
-	fallbackResp, err := c.apiClient().ListJobsRaw(ctx, &generated.ListJobsRequestOptions{Query: &generated.ListJobsQuery{GitRef: &sha, Limit: new(int64(100))}})
+	fallbackResp, err := c.apiClient().ListJobsRaw(ctx, &generated.ListJobsRequestOptions{Query: &generated.ListJobsQuery{OmitStats: new(generated.ListJobsQueryOmitStatsTrue), GitRef: &sha, Limit: new(int64(100))}})
 	if err != nil {
 		return nil, fmt.Errorf("fallback query for %s: %w", sha, err)
 	}
@@ -338,7 +343,7 @@ func (c *HTTPClient) FindPendingJobForRef(ctx context.Context, repoPath, gitRef 
 	// Use server-side status filtering to find pending jobs.
 	// Query for queued first, then running - this avoids pagination issues.
 	for _, status := range []string{"queued", "running"} {
-		resp, err := c.apiClient().ListJobsRaw(ctx, &generated.ListJobsRequestOptions{Query: &generated.ListJobsQuery{GitRef: &gitRef, Repo: []string{normalizedRepo}, Status: &status, Limit: new(int64(1))}})
+		resp, err := c.apiClient().ListJobsRaw(ctx, &generated.ListJobsRequestOptions{Query: &generated.ListJobsQuery{OmitStats: new(generated.ListJobsQueryOmitStatsTrue), GitRef: &gitRef, Repo: []string{normalizedRepo}, Status: &status, Limit: new(int64(1))}})
 		if err != nil {
 			return nil, err
 		}
@@ -363,6 +368,100 @@ func (c *HTTPClient) FindPendingJobForRef(ctx context.Context, repoPath, gitRef 
 	}
 
 	return nil, nil
+}
+
+// FindPostCommitRangeReviewForHead finds the newest canonical post-commit
+// range review for the named branch that ends at the fix commit. Batched hooks
+// persist their checkpoint in the range's left side, so callers cannot rebuild
+// the full git_ref from the current branch configuration.
+func (c *HTTPClient) FindPostCommitRangeReviewForHead(
+	ctx context.Context,
+	repoPath, branch, headSHA string,
+) (*storage.ReviewJob, error) {
+	if branch == "" || headSHA == "" {
+		return nil, nil
+	}
+
+	normalizedRepo := repoPath
+	if mainRoot, err := gitrepo.MainRoot(ctx, repoPath); err == nil {
+		normalizedRepo = mainRoot
+	}
+	if resolved, err := pathresolve.EvalSymlinks(normalizedRepo); err == nil {
+		normalizedRepo = resolved
+	}
+	if abs, err := filepath.Abs(normalizedRepo); err == nil {
+		normalizedRepo = abs
+	}
+
+	var newest *storage.ReviewJob
+	for _, jobType := range []string{storage.JobTypeRange, storage.JobTypeSynthesis} {
+		cursor := ""
+		for {
+			omitPrompt := generated.ListJobsQueryOmitPromptTrue
+			query := &generated.ListJobsQuery{
+				Repo:       []string{normalizedRepo},
+				Branch:     &branch,
+				JobType:    &jobType,
+				OmitPrompt: &omitPrompt,
+			}
+			if cursor != "" {
+				query.Cursor = &cursor
+			}
+			resp, err := c.apiClient().ListJobsRaw(ctx, &generated.ListJobsRequestOptions{Query: query})
+			if err != nil {
+				return nil, err
+			}
+			if resp.StatusCode != http.StatusOK {
+				resp.Body.Close()
+				return nil, fmt.Errorf("query post-commit range reviews for %s: server returned %s", branch, resp.Status)
+			}
+
+			var result struct {
+				Jobs       []storage.ReviewJob `json:"jobs"`
+				HasMore    bool                `json:"has_more"`
+				NextCursor *string             `json:"next_cursor"`
+			}
+			decodeErr := json.UnmarshalRead(resp.Body, &result)
+			resp.Body.Close()
+			if decodeErr != nil {
+				return nil, fmt.Errorf("query post-commit range reviews for %s: decode error: %w", branch, decodeErr)
+			}
+
+			foundForType := false
+			for i := range result.Jobs {
+				job := &result.Jobs[i]
+				if job.Source != storage.JobSourcePostCommit ||
+					job.PanelRole == storage.PanelRoleMember ||
+					!job.IsReadableReview() ||
+					!reviewRangeEndsAtHead(job.GitRef, headSHA) {
+					continue
+				}
+				if newest == nil || job.EnqueuedAt.After(newest.EnqueuedAt) ||
+					job.EnqueuedAt.Equal(newest.EnqueuedAt) && job.ID > newest.ID {
+					copy := *job
+					newest = &copy
+				}
+				// ListJobs is ordered newest first, so this is the latest
+				// matching job for this job type.
+				foundForType = true
+				break
+			}
+
+			if foundForType || !result.HasMore {
+				break
+			}
+			if result.NextCursor == nil || *result.NextCursor == "" || *result.NextCursor == cursor {
+				return nil, fmt.Errorf("query post-commit range reviews for %s: invalid server response: more results reported without a next page", branch)
+			}
+			cursor = *result.NextCursor
+		}
+	}
+	return newest, nil
+}
+
+func reviewRangeEndsAtHead(gitRef, headSHA string) bool {
+	base, head, ok := strings.Cut(gitRef, "..")
+	return ok && base != "" && (head == headSHA || head == "HEAD")
 }
 
 func (c *HTTPClient) GetCommentsForJob(ctx context.Context, jobID int64) ([]storage.Response, error) {

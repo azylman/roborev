@@ -3,7 +3,6 @@ package storage
 import (
 	"fmt"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 	"uuid"
@@ -25,21 +24,14 @@ func TestTokenCostCandidateQueriesSeekStartedAtIndex(t *testing.T) {
 	}{
 		{"costs", listTokenCostCandidatesQuery},
 		{"logs", listTokenUsageLogCandidatesQuery},
+		{"due costs", func(afterJobID int64, limit int, startedAfter time.Time, machineID uuid.UUID) (string, []any) {
+			return listDueTokenCostCandidatesQuery(afterJobID, limit, startedAfter, time.Now(), machineID)
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			query, args := tc.build(0, 20, cutoff, machineID)
-			rows, err := db.QueryContext(t.Context(), "EXPLAIN QUERY PLAN "+query, args...)
-			require.NoError(t, err)
-			defer rows.Close()
-			var details []string
-			for rows.Next() {
-				var id, parent, unused int
-				var detail string
-				require.NoError(t, rows.Scan(&id, &parent, &unused, &detail))
-				details = append(details, detail)
-			}
-			require.NoError(t, rows.Err())
-			assert.Contains(t, strings.Join(details, "\n"), "SEARCH j USING INDEX idx_review_jobs_source_started (source_machine_id=? AND <expr>>?)")
+			plan := queryPlan(t, db, query, args...)
+			assert.Contains(t, plan, "SEARCH j USING INDEX idx_review_jobs_source_started (source_machine_id=? AND <expr>>?)")
 		})
 	}
 }
@@ -848,4 +840,71 @@ func TestBackfillJobTokenUsageIfCurrentRejectsStaleUsage(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.False(t, updated)
+}
+
+func TestTokenCostLookupsGateOnlyTheirOwnUnpricedAttempt(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	machineID, err := db.GetMachineID()
+	require.NoError(t, err)
+	_, jobs := seedJobs(t, db, filepath.Join(t.TempDir(), "repo"), 3)
+	now := time.Now()
+	startedAt := formatSQLiteTimestamp(now.Add(-time.Hour))
+	for i, job := range jobs {
+		_, err := db.ExecContext(t.Context(), `
+			UPDATE review_jobs
+			SET status = 'done', started_at = ?, finished_at = ?, session_id = ?,
+			    agent_invoked = 1, token_usage = '', source_machine_id = ?
+			WHERE id = ?`,
+			startedAt, startedAt, fmt.Sprintf("session-%d", i), machineID, job.ID)
+		require.NoError(t, err)
+	}
+	unpriced, priced, rerun := jobs[0], jobs[1], jobs[2]
+	for i, job := range jobs {
+		require.NoError(t, db.SaveTokenCostLookup(t.Context(), TokenCostLookup{
+			JobID: job.ID, StartedAt: startedAt, SessionID: fmt.Sprintf("session-%d", i),
+			Misses: 4, NoUsageSessionID: fmt.Sprintf("session-%d", i),
+		}))
+	}
+
+	// A stopped lookup keeps its attempt out of the due scan.
+	due, err := db.ListDueTokenCostCandidates(t.Context(), 0, 10, now.Add(-24*time.Hour), now)
+	require.NoError(t, err)
+	assert.Empty(t, due)
+
+	_, err = db.ExecContext(t.Context(),
+		`UPDATE review_jobs SET token_usage = '{"has_cost":true,"cost_usd":0.1}' WHERE id = ?`,
+		priced.ID)
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(),
+		`UPDATE review_jobs SET started_at = ?, session_id = 'session-new' WHERE id = ?`,
+		formatSQLiteTimestamp(now), rerun.ID)
+	require.NoError(t, err)
+
+	// The rerun's new attempt has no lookup state yet, so it is due.
+	due, err = db.ListDueTokenCostCandidates(t.Context(), 0, 10, now.Add(-24*time.Hour), now)
+	require.NoError(t, err)
+	require.Len(t, due, 1)
+	assert.Equal(t, rerun.ID, due[0].JobID)
+	assert.Equal(t, 0, due[0].LookupMisses)
+
+	require.NoError(t, db.PruneTokenCostLookups(t.Context(), now.Add(-24*time.Hour)))
+	var remaining []int64
+	rows, err := db.QueryContext(t.Context(), `SELECT job_id FROM token_cost_lookups ORDER BY job_id`)
+	require.NoError(t, err)
+	for rows.Next() {
+		var jobID int64
+		require.NoError(t, rows.Scan(&jobID))
+		remaining = append(remaining, jobID)
+	}
+	require.NoError(t, rows.Err())
+	require.NoError(t, rows.Close())
+	assert.Equal(t, []int64{unpriced.ID}, remaining)
+
+	// Once the attempt leaves the scan window, its state goes too.
+	require.NoError(t, db.PruneTokenCostLookups(t.Context(), now))
+	var count int
+	require.NoError(t, db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM token_cost_lookups`).Scan(&count))
+	assert.Equal(t, 0, count)
 }

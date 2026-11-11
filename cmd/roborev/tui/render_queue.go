@@ -217,8 +217,7 @@ func (m model) queueVisibleRows() int {
 }
 
 func (m model) canPaginate() bool {
-	return m.hasMore && !m.loadingMore && !m.loadingJobs &&
-		m.activeBranchFilter != branchNone
+	return m.hasMore && !m.loadingMore && !m.loadingJobs
 }
 
 // visibleSelectedRowIndex returns the index of selectedJobID within the
@@ -508,6 +507,34 @@ func (m model) renderQueueTitle() string {
 	return fitTitleLeft(app, filters, hideClosed, width)
 }
 
+// firstReviewLines wraps the empty-queue message for a scope that has never
+// been reviewed to width: a bold title, a dimmed explanation, and after a
+// blank line the command, indented in the title's accent color. When the
+// message is taller than height, the blank line, then the explanation, then
+// the title drop so the command stays visible.
+func firstReviewLines(width, height int) []string {
+	wrap := func(style lipgloss.Style, text string) []string {
+		var lines []string
+		for line := range strings.SplitSeq(xansi.Wrap(text, width, ""), "\n") {
+			lines = append(lines, style.Render(line))
+		}
+		return lines
+	}
+	title := wrap(lipgloss.NewStyle().Bold(true), "No reviews yet")
+	explain := wrap(statusStyle, "Your next commit starts a review. To review the current commit now, run:")
+	command := wrap(lipgloss.NewStyle().Foreground(titleStyle.GetForeground()), "  roborev review")
+	for _, lines := range [][]string{
+		slices.Concat(title, explain, []string{""}, command),
+		slices.Concat(title, explain, command),
+		slices.Concat(title, command),
+	} {
+		if len(lines) <= height {
+			return lines
+		}
+	}
+	return command[:min(len(command), max(height, 1))]
+}
+
 func (m model) renderQueueView() string {
 	var b strings.Builder
 	compact := m.queueCompact()
@@ -516,36 +543,7 @@ func (m model) renderQueueView() string {
 	b.WriteString("\x1b[K\n") // Clear to end of line
 
 	if !compact {
-		// Status line - use server-side aggregate counts for paginated views
-		// (including multi-repo display names, scoped via an IN clause). Only
-		// the "(none)" branch sentinel still loads all jobs to count locally.
-		var done, closed, open int
-		if m.activeBranchFilter == branchNone {
-			// Client-side filtered views load all jobs, so count locally
-			for _, job := range m.jobs {
-				if len(m.activeRepoFilter) > 0 && !m.repoMatchesFilter(job.RepoPath) {
-					continue
-				}
-				if m.activeBranchFilter == branchNone && job.Branch != "" {
-					continue
-				}
-				if job.Status == storage.JobStatusDone {
-					done++
-					if job.Closed != nil {
-						if *job.Closed {
-							closed++
-						} else {
-							open++
-						}
-					}
-				}
-			}
-		} else {
-			done = m.jobStats.Done
-			closed = m.jobStats.Closed
-			open = m.jobStats.Open
-		}
-		b.WriteString(m.renderQueueStatusLine(done, closed, open))
+		b.WriteString(m.renderQueueStatusLine(m.jobStats.Done, m.jobStats.Closed, m.jobStats.Open))
 		b.WriteString("\x1b[K\n") // Clear status line
 
 		// Update notification on line 3 (above the table)
@@ -580,23 +578,28 @@ func (m model) renderQueueView() string {
 	end := 0
 
 	if len(rows) == 0 {
-		if m.loadingJobs || m.loadingMore {
-			b.WriteString("Loading...")
-			b.WriteString("\x1b[K\n")
-		} else if len(m.activeRepoFilter) > 0 || m.hideClosed {
-			b.WriteString("No jobs matching filters")
-			b.WriteString("\x1b[K\n")
-		} else {
-			b.WriteString("No jobs in queue")
-			b.WriteString("\x1b[K\n")
-		}
-		// Pad empty queue to fill visibleRows (minus 1 for the message we just wrote)
+		// Pad empty queue to fill visibleRows (minus the message lines)
 		// Also need header lines (2) to match non-empty case (skip in compact)
-		linesWritten := 1
 		padTarget := visibleRows
 		if !compact {
 			padTarget += 2 // +2 for header lines we skipped
 		}
+		var msg []string
+		switch {
+		case m.loadingJobs || m.loadingMore:
+			msg = []string{"Loading..."}
+		case m.showFirstReview():
+			msg = firstReviewLines(m.width, padTarget)
+		case len(m.activeRepoFilter) > 0 || m.hideClosed:
+			msg = []string{"No jobs matching filters"}
+		default:
+			msg = []string{"No jobs in queue"}
+		}
+		for _, line := range msg {
+			b.WriteString(line)
+			b.WriteString("\x1b[K\n")
+		}
+		linesWritten := len(msg)
 		for linesWritten < padTarget {
 			b.WriteString("\x1b[K\n")
 			linesWritten++
@@ -635,7 +638,7 @@ func (m model) renderQueueView() string {
 		if len(rows) > visibleRows || m.hasMore || m.loadingMore {
 			if m.loadingMore {
 				scrollInfo = fmt.Sprintf("[showing %d-%d of %d] Loading more...", start+1, end, len(rows))
-			} else if m.hasMore && m.activeBranchFilter != branchNone {
+			} else if m.hasMore {
 				scrollInfo = fmt.Sprintf("[showing %d-%d of %d+] scroll down to load more", start+1, end, len(rows))
 			} else if len(rows) > visibleRows {
 				scrollInfo = fmt.Sprintf("[showing %d-%d of %d]", start+1, end, len(rows))

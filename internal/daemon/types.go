@@ -14,30 +14,33 @@ import (
 )
 
 type EnqueueRequest struct {
-	SpecFile          *string  `json:"spec_file,omitempty"`
-	PlanFile          *string  `json:"plan_file,omitempty"`
-	RepoPath          string   `json:"repo_path"`
-	CommitSHA         string   `json:"commit_sha,omitempty"` // Single commit (for backwards compat)
-	GitRef            string   `json:"git_ref,omitempty"`    // Single commit, range like "abc..def", or "dirty"
-	Branch            string   `json:"branch,omitempty"`     // Branch name at time of job creation
-	Since             string   `json:"since,omitempty"`      // RFC3339 lower bound for insights datasets
-	Agent             string   `json:"agent,omitempty"`
-	Model             string   `json:"model,omitempty"`               // Model to use (for opencode: provider/model format)
-	DiffContent       string   `json:"diff_content,omitempty"`        // Pre-captured diff for dirty reviews
-	DirtyFiles        []string `json:"dirty_files,omitempty"`         // Unfiltered dirty file names for prompt metadata
-	Reasoning         string   `json:"reasoning,omitempty"`           // Legacy or exact reasoning level
-	ReviewType        string   `json:"review_type,omitempty"`         // Review type (e.g., "security") — changes system prompt
-	CustomPrompt      string   `json:"custom_prompt,omitempty"`       // Custom prompt for ad-hoc agent work
-	Agentic           bool     `json:"agentic,omitempty"`             // Enable agentic mode (allow file edits)
-	OutputPrefix      string   `json:"output_prefix,omitempty"`       // Prefix to prepend to review output
-	AnalysisType      string   `json:"analysis_type,omitempty"`       // Recorded analyze type
-	AnalysisFiles     []string `json:"analysis_files,omitempty"`      // Repository-relative files supplied to analyze
-	AnalysisCommitSHA string   `json:"analysis_commit_sha,omitempty"` // Commit whose contents were supplied to analyze
-	JobType           string   `json:"job_type,omitempty"`            // Explicit job type (review/range/dirty/task/insights/compact/fix)
-	Provider          string   `json:"provider,omitempty"`            // Provider for pi agent (e.g., "anthropic")
-	MinSeverity       string   `json:"min_severity,omitempty"`        // Minimum severity filter: critical, high, medium, low
-	Panel             string   `json:"panel,omitempty"`               // Panel name; "none" forces single-agent
-	Source            string   `json:"source,omitempty"`              // Provenance, e.g. "post_commit" (empty = foreground)
+	ReviewSettings    *SuppliedReviewSettings `json:"review_settings,omitempty"` // Authoritative policy for review_prompt; ignores repository configuration
+	SpecFile          *string                 `json:"spec_file,omitempty"`
+	PlanFile          *string                 `json:"plan_file,omitempty"`
+	RepoPath          string                  `json:"repo_path"`
+	CommitSHA         string                  `json:"commit_sha,omitempty"` // Single commit (for backwards compat)
+	GitRef            string                  `json:"git_ref,omitempty"`    // Single commit, range like "abc..def", or "dirty"
+	Branch            string                  `json:"branch,omitempty"`     // Branch name at time of job creation
+	Since             string                  `json:"since,omitempty"`      // RFC3339 lower bound for insights datasets
+	Agent             string                  `json:"agent,omitempty"`
+	Model             string                  `json:"model,omitempty"`               // Model to use (for opencode: provider/model format)
+	DiffContent       string                  `json:"diff_content,omitempty"`        // Pre-captured diff for dirty reviews
+	DirtyFiles        []string                `json:"dirty_files,omitempty"`         // Unfiltered dirty file names for prompt metadata
+	Reasoning         string                  `json:"reasoning,omitempty"`           // Legacy or exact reasoning level
+	ReviewType        string                  `json:"review_type,omitempty"`         // Review type (e.g., "security") — changes system prompt
+	CustomPrompt      string                  `json:"custom_prompt,omitempty"`       // Custom prompt for ad-hoc agent work
+	ReviewPrompt      string                  `json:"review_prompt,omitempty"`       // Supplied review prompt for a committed revision; runs in an exact checkout
+	Agentic           bool                    `json:"agentic,omitempty"`             // Enable agentic mode (allow file edits)
+	OutputPrefix      string                  `json:"output_prefix,omitempty"`       // Prefix to prepend to review output
+	AnalysisType      string                  `json:"analysis_type,omitempty"`       // Recorded analyze type
+	AnalysisFiles     []string                `json:"analysis_files,omitempty"`      // Repository-relative files supplied to analyze
+	AnalysisCommitSHA string                  `json:"analysis_commit_sha,omitempty"` // Commit whose contents were supplied to analyze
+	JobType           string                  `json:"job_type,omitempty"`            // Explicit job type (review/range/dirty/task/insights/compact/fix)
+	Provider          string                  `json:"provider,omitempty"`            // Provider for pi agent (e.g., "anthropic")
+	MinSeverity       string                  `json:"min_severity,omitempty"`        // Minimum severity filter: critical, high, medium, low
+	Panel             string                  `json:"panel,omitempty"`               // Panel name; "none" forces single-agent
+	HoldSynthesis     bool                    `json:"hold_synthesis,omitempty"`      // Wait for an explicit synthesis request; requires a named foreground panel
+	Source            string                  `json:"source,omitempty"`              // Provenance, e.g. "post_commit" (empty = foreground)
 }
 
 // EnqueueCreatedResponse is returned when an enqueue creates a single job.
@@ -106,7 +109,7 @@ type ListJobsInput struct {
 	AnalysisType        string    `query:"analysis_type" doc:"Filter by recorded analysis type"`
 	AnalysisFile        []string  `query:"analysis_file,explode" doc:"Filter by recorded analysis file (repeatable)"`
 	Branch              string    `query:"branch" doc:"Filter by branch name"`
-	BranchEmpty         string    `query:"branch_empty" doc:"Only jobs with empty or unset branch" enum:"true,false,"`
+	BranchEmpty         string    `query:"branch_empty" doc:"Only jobs with empty/unset branch or the \"(none)\" placeholder stored when no branch was found" enum:"true,false,"`
 	BranchIncludeEmpty  string    `query:"branch_include_empty" doc:"Include jobs with no branch when filtering by branch" enum:"true,false,"`
 	Closed              string    `query:"closed" doc:"Filter by review closed state" enum:"true,false,"`
 	JobType             string    `query:"job_type" doc:"Filter by job type"`
@@ -114,6 +117,8 @@ type ListJobsInput struct {
 	HideClassifyJobs    string    `query:"hide_classify_jobs" doc:"Hide auto-design-router rows (job_type=classify and status=skipped)" enum:"true,false,"`
 	PanelRun            uuid.UUID `query:"panel_run" doc:"Return all jobs (members + synthesis) of one panel run"`
 	IncludePanelMembers string    `query:"include_panel_members" doc:"Include individual panel member jobs alongside panel synthesis jobs" enum:"true,false,"`
+	IncludeTotals       string    `query:"include_totals" doc:"Include total jobs and distinct repository counts in stats" enum:"true,false,"`
+	OmitStats           string    `query:"omit_stats" doc:"Skip the queue counts (stats and filtered_stats) for callers that only read jobs" enum:"true,false,"`
 	OmitPrompt          string    `query:"omit_prompt" doc:"Omit prompt and diff content from returned jobs (metadata-only listing; queued/running jobs keep their prompt)" enum:"true,false,"`
 	IncludeFindings     string    `query:"include_findings" doc:"Include nullable finding severity counts for eligible completed reviews" enum:"true,false,"`
 	RepoPrefix          string    `query:"repo_prefix" doc:"Filter repos by path prefix"`
@@ -610,7 +615,7 @@ type GetSummaryOutput struct {
 type GetCostInput struct {
 	Repo        []string `query:"repo,explode" doc:"Repo root paths (repeatable)"`
 	Branch      string   `query:"branch" doc:"Filter by branch name"`
-	BranchEmpty string   `query:"branch_empty" doc:"Only jobs with empty/unset branch" enum:"true,false"`
+	BranchEmpty string   `query:"branch_empty" doc:"Only jobs with empty/unset branch or the \"(none)\" placeholder stored when no branch was found" enum:"true,false"`
 	Since       string   `query:"since" doc:"Time window (e.g. 7d); default all-time"`
 }
 

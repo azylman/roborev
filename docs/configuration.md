@@ -922,9 +922,10 @@ auto-prefers `agy` before the legacy `gemini` command; set
 Gemini model overrides.
 
 A custom `cursor_cmd` must forward `--version` or `-v` to Cursor and produce
-non-empty version output that does not identify as Grok. Wrappers that ignore
-version flags, hang, or print nothing are treated as unavailable (fail-closed
-identity probe), so a Grok-only `agent` alias cannot be selected as Cursor.
+non-empty version output that does not identify as Grok. The version check has
+up to five seconds to respond. Wrappers that ignore version flags, hang, or
+print nothing are treated as unavailable (fail-closed identity probe), so a
+Grok-only `agent` alias cannot be selected as Cursor.
 
 ### Agent Name Validation
 
@@ -1880,6 +1881,15 @@ EOF
 launchctl load ~/Library/LaunchAgents/com.roborev.daemon.plist
 ```
 
+On macOS, recovery finds the daemon's LaunchAgent by matching the daemon or an
+ancestor against the jobs listed by `launchctl print` in the user's domains. An
+outdated daemon owned by that job is replaced with `launchctl kickstart` after
+running reviews finish. A wrapper child or another installation stays in use. An
+unreadable job stops recovery before shutdown. `roborev daemon restart` and
+`roborev update` replace the daemon through its job too. They stop before
+shutdown for a wrapper child, another installation, or an unreadable job. Use
+`roborev update --no-restart` to install without restarting.
+
 The heredoc expands `${ROBOREV_BIN}`, `${BREW_PREFIX}`, and `${HOME}` at
 generation time so the plist contains absolute paths. Launchd does not expand
 `~` or environment variables in plist values.
@@ -1894,8 +1904,8 @@ files, enable the user-level service:
 systemctl --user enable --now roborev
 ```
 
-Ordinary CLI commands replace an outdated daemon, or one that stops responding
-after discovery, through its owning user service after active reviews finish:
+Ordinary CLI commands replace a responsive outdated daemon through its owning
+user service after active reviews finish:
 
 1. Under the start lock, the command rediscovers the daemon and reuses a
     responsive replacement already running this CLI's version.
@@ -1939,10 +1949,11 @@ user manager cannot answer. Otherwise recovery waits up to two minutes for a
 managed replacement.
 
 Before managed recovery drains reviews or starts the service, local
-`roborev daemon pause` must save the pause through the current daemon, even if
-the initial version check failed. If rediscovery misses the daemon, the command
-tries its last known runtime API unless ownership lookup confirms the process
-has exited. In that case, recovery returns an error without dialing an
+`roborev daemon pause` must save the pause through the current daemon. A live
+managed daemon that fails HTTP probes stays running, and the command reports the
+error with manual restart guidance. If rediscovery misses the daemon, the
+command tries its last known runtime API unless ownership lookup confirms the
+process has exited. In that case, recovery returns an error without dialing an
 activation socket that could start unpaused workers. This keeps replacement
 workers from claiming queued jobs. If the pause write fails, recovery returns an
 error before draining reviews or starting the service. If recovery fails after
@@ -2273,11 +2284,22 @@ zero, or negative values also fall back to `10s`.
 
 Usage indexing can lag behind job completion. The daemon retries fresh misses
 and periodically revisits terminal jobs from the past week that still lack a
-recorded price. The missing price in SQLite is the durable retry state, so
-reconciliation resumes after daemon restarts. Each lookup can start an
-`agentsview` process, so a job that stays unpriced is rechecked with backoff:
-the wait starts at one minute and doubles after each miss. The backoff resets
-when the daemon restarts. For rows without a stored session ID, the daemon
+recorded price. With AgentsView v0.47.0 or later, a successful periodic page
+uses one `session usage-batch` process. A failed batch falls back to individual
+lookups. Fresh retries, older CLIs, and configured HTTP endpoints also use
+individual lookups. A job that stays unpriced is rechecked with backoff: the
+wait starts at one minute and doubles after each miss. The daemon stores the
+backoff in SQLite, so it continues after a restart.
+
+The daemon stops looking up a job when the provider reports the same session
+with no token or cost data on two lookups in a row, and the later lookup comes
+at least 15 minutes after the job finished. A job with several phase sessions,
+such as a planner and an implementation session, keeps its lookups when the
+empty report moves from one session to another. That report is an HTTP `200`
+with `has_token_data` and `has_cost` false (or no nonzero counts), or exit code
+`3` from the `agentsview` CLI. A session the provider has not indexed (`404` or
+exit code `2`) keeps the backoff and is never treated as final. Rerunning a job
+starts its lookups over. For rows without a stored session ID, the daemon
 recovers the ID and token counts from the per-job JSONL log before retrying the
 provider. Provider failures do not change the completed job result. Deleted
 sessions and sessions reused by multiple started jobs can remain unpriced; jobs
@@ -2301,8 +2323,10 @@ The endpoint should return JSON compatible with
 ```
 
 `has_token_data` and `has_cost` are required booleans. When `has_token_data` is
-true, token counts are required. A `404` response is treated as no usage data
-for that session.
+true, `total_output_tokens` and either `peak_context_tokens` or `input_tokens`
+are required; zero is a valid count. A `404` response means the provider has not
+indexed the session yet. A `200` response with no nonzero counts and no cost
+means the session has no usage data.
 
 When `has_cost` is true, the cost must arrive in one of two shapes. Either
 `cost_usd` as a float, or the integer envelope agentsview adopted in v0.39.0:
@@ -2815,8 +2839,12 @@ commit degrades to the classifier instead of being silently skipped.
 The daemon `/api/status` endpoint exposes a `SkippedJobs` aggregate count, plus
 an `auto_design` subobject with five per-outcome counters (`triggered`,
 `skipped_heuristic`, `triggered_classifier`, `skipped_classifier`, `errored`)
-when the feature is enabled anywhere. The subobject is omitted from the JSON
-when the feature is disabled across all repos.
+when the feature is enabled globally or the latest completed repo scan found it
+enabled. The initial scan runs in the background at daemon startup; the
+subobject is omitted until global config or a completed scan enables it. Once
+the cached scan is 30 seconds old, the next status request starts a background
+rescan and returns the cached answer. Requests after it finishes reflect
+per-repo changes, including newly registered repos.
 
 ## Reasoning Levels
 

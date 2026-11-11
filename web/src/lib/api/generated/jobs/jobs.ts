@@ -11,10 +11,12 @@ import type {
   EnqueueRequest,
   EnqueueSkippedResponse,
   FixJobRequest,
+  GetJobInvocationsParams,
   GetJobLogParams,
   GetJobOutputParams,
   GetJobPatchParams,
   JobIDRequest,
+  JobInvocationsOutputBody,
   JobStatusOutputBody,
   ListJobsOutputBody,
   ListJobsParams,
@@ -25,6 +27,7 @@ import type {
   RerunJobOutputBody,
   RerunJobRequest,
   ReviewJob,
+  StartPanelSynthesisInputBody,
   TokenSummary,
   UpdateJobBranchOutputBody,
   UpdateJobBranchRequest,
@@ -234,6 +237,38 @@ export const createFixJob = async (
     },
     body: JSON.stringify(fixJobRequest),
   });
+};
+
+export const getGetJobInvocationsUrl = (params: GetJobInvocationsParams) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? "null" : String(value));
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0
+    ? `/api/job/invocations?${stringifiedParams}`
+    : `/api/job/invocations`;
+};
+
+/**
+ * @summary Get locally recorded agent invocations for a supplied review
+ */
+export const getJobInvocations = async (
+  params: GetJobInvocationsParams,
+  options?: RequestInit,
+): Promise<JobInvocationsOutputBody> => {
+  return roborevFetch<JobInvocationsOutputBody>(
+    getGetJobInvocationsUrl(params),
+    {
+      ...options,
+      method: "GET",
+    },
+  );
 };
 
 export const getGetJobLogUrl = (params?: GetJobLogParams) => {
@@ -530,6 +565,49 @@ export const batchJobs = async (
       ...getHeaders(options?.headers),
     },
     body: JSON.stringify(batchJobsRequest),
+  });
+};
+
+export const getStartPanelSynthesisUrl = () => {
+  return `/api/panel/synthesize`;
+};
+
+/**
+ * @summary Start a held panel's synthesis after its voting members finish
+ */
+export const startPanelSynthesis = async (
+  startPanelSynthesisInputBody: NonReadonly<StartPanelSynthesisInputBody>,
+  options?: RequestInit,
+): Promise<ReviewJob> => {
+  const getHeaders = (
+    h?: NonNullable<RequestInit["headers"]>,
+  ): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(
+          h as Iterable<Iterable<string>>,
+          (entry) => Array.from(entry) as [string, string],
+        ),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<
+      string | readonly string[] | undefined
+    >(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+  return roborevFetch<ReviewJob>(getStartPanelSynthesisUrl(), {
+    ...options,
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...getHeaders(options?.headers),
+    },
+    body: JSON.stringify(startPanelSynthesisInputBody),
   });
 };
 

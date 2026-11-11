@@ -22,6 +22,32 @@ import (
 	"go.kenn.io/roborev/pkg/structuredreview"
 )
 
+func TestExportReviewsPagesUseCompletedIndex(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+	defer db.Close()
+	cursor := &exportCursor{CompletedAt: "2026-06-29 00:00:00", ReviewID: uuid.MustParse("00000000-0000-4000-8000-000000000001")}
+	for _, tc := range []struct {
+		name       string
+		cursor     *exportCursor
+		closedOnly bool
+		access     string
+	}{
+		{"first", nil, false, "SCAN rv USING INDEX idx_reviews_export_completed"},
+		{"cursor", cursor, false, "SEARCH rv USING INDEX idx_reviews_export_completed (<expr>>?)"},
+		{"closed first", nil, true, "SCAN rv USING INDEX idx_reviews_export_completed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			query, args := exportReviewRowsQuery(ExportReviewsOptions{Profile: ExportProfileMetadata, Limit: 500, ClosedOnly: tc.closedOnly}, tc.cursor)
+			plan := queryPlan(t, db, query, args...)
+			assert := assert.New(t)
+			assert.Contains(plan, tc.access)
+			assert.Contains(plan, "SEARCH cp USING INDEX idx_ci_panels_panel_run (panel_run_uuid=?) LEFT-JOIN")
+			assert.NotContains(plan, "USE TEMP B-TREE FOR ORDER BY")
+		})
+	}
+}
+
 func TestExportReviewsContentProfile(t *testing.T) {
 	t.Parallel()
 	db := openTestDB(t)
@@ -982,6 +1008,8 @@ func TestOpenBackfillsVerdictBoolForExport(t *testing.T) {
 	claimJob(t, db, "w1")
 	require.NoError(t, completeReviewFixture(db, job.ID, "codex", "prompt", "No issues found."))
 	_, err = db.ExecContext(t.Context(), `UPDATE reviews SET verdict_bool = NULL WHERE job_id = ?`, job.ID)
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(), `DELETE FROM sync_state WHERE key = ?`, SyncStateHistoricalReviewsMigrated)
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 

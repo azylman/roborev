@@ -1,5 +1,5 @@
 ---
-last_edited: 2026-10-31
+last_edited: 2026-11-06
 title: MCP Server
 description: Expose roborev review data to AI agents over the Model Context Protocol using stdio or streamable HTTP
 ---
@@ -180,6 +180,10 @@ The JSON form is an array, empty when no daemon has `[mcp]` enabled.
 
 ## Tools
 
+The complete tool catalog, including write tools and schemas, measured 19,684
+bytes of JSON on November 6, 2026. `TestRegisteredToolsAndGuidance` enforces a
+22,000-byte budget. Budget increases require an explicit reviewed edit.
+
 | Tool | Purpose |
 |------|---------|
 | `roborev_add_comment` | Add a comment with `job_id`, `commenter`, and `comment` |
@@ -198,6 +202,15 @@ The JSON form is an array, empty when no daemon has `[mcp]` enabled.
 Job listings omit prompts and diffs. Review results omit the prompt and return
 `verdict` as `pass`, `fail`, or empty when no verdict exists yet.
 
+Every tool declares its read-only, destructive, idempotent, and open-world
+hints. Reads are non-destructive and idempotent. Search is open-world because
+semantic and hybrid modes can send the query to the configured embedding
+provider; the other tools operate on the daemon's data. Adding a comment is
+additive and non-idempotent. Closing reviews and changing snoozes update
+existing state and timestamps, so they are conservatively non-idempotent.
+Completing an exact fix session removes it and is idempotent. These hints help
+clients classify calls; they do not authorize them.
+
 `roborev_search_reviews` accepts `query`, `mode`, `repo`, `branch`, `since`,
 `verdict`, `state`, and `limit`. Search is global when `repo` is omitted. Use
 `auto` for normal discovery, `lexical` for exact paths, identifiers, SHA
@@ -210,6 +223,10 @@ and vector coverage. Fetch a matched review with `roborev_get_review`, then use
 `roborev_list_comments` only when its responses are needed. See
 [Review History Search](/docs/search/) for exact mode, freshness, privacy, and
 coverage semantics.
+
+Unfiltered, empty multi-word lexical results with complete coverage include an
+`every_word_required` hint with `code` and `message`: “no review contains every
+word; search again with fewer words”.
 
 Errors are returned as tool errors with a stable `code` of `not_found`,
 `invalid_argument`, `unavailable`, or `internal`.

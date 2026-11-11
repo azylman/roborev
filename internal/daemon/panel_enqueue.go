@@ -142,6 +142,13 @@ func (s *Server) buildTargetDescriptor(
 		return targetDescriptor{}, early
 	}
 	desc.source = in.req.Source
+	if in.req.ReviewPrompt != "" {
+		// Choose the code-review type before adding a stored prompt, which
+		// otherwise makes storage infer an ad-hoc task.
+		desc.jobType = storage.JobTypeForEnqueue(desc.baseOpts())
+		desc.prompt = in.req.ReviewPrompt
+		desc.promptPrebuilt = true
+	}
 	return desc, nil
 }
 
@@ -282,8 +289,10 @@ func (s *Server) descriptorForRange(
 	}
 
 	fullRef := startSHA + ".." + endSHA
-	if skip := s.rangeExclusionSkip(in.repoRoot, in.metadata, fullRef); skip != nil {
-		return targetDescriptor{}, skip
+	if in.req.ReviewSettings == nil {
+		if skip := s.rangeExclusionSkip(in.repoRoot, in.metadata, fullRef); skip != nil {
+			return targetDescriptor{}, skip
+		}
 	}
 
 	return targetDescriptor{
@@ -346,8 +355,10 @@ func (s *Server) descriptorForSingleCommit(
 		return targetDescriptor{}, out
 	}
 
+	sha = info.SHA
+
 	fullMessage := info.Subject + "\n" + info.Body
-	if config.IsCommitMessageExcluded(in.repoRoot, fullMessage) {
+	if in.req.ReviewSettings == nil && config.IsCommitMessageExcluded(in.repoRoot, fullMessage) {
 		out, _ := rawJSONOutput(http.StatusOK, EnqueueSkippedResponse{
 			Skipped: true,
 			Reason:  "commit message matches an excluded pattern",
@@ -605,6 +616,17 @@ func (s *Server) enqueuePanelRun(ctx context.Context, in panelRunInputs) (*RawJS
 		return rawJSONOutput(http.StatusBadRequest, ErrorResponse{Error: err.Error()})
 	}
 	members, memberOpts, synthOpts := plan.members, plan.memberOpts, plan.synthOpts
+	if in.req.HoldSynthesis {
+		snapshot, err := synthesisConfig(&storage.ReviewJob{JobType: storage.JobTypeSynthesis, PanelMemberConfigJSON: synthOpts.PanelMemberConfigJSON})
+		if err != nil {
+			return nil, err
+		}
+		snapshot.HoldSynthesis = true
+		synthOpts.PanelMemberConfigJSON, err = snapshot.encode()
+		if err != nil {
+			return nil, err
+		}
+	}
 	if in.experiment != nil {
 		plan, planErr := experimentPlanForPanel(memberOpts, synthOpts)
 		if planErr != nil {

@@ -34,6 +34,7 @@ func (m model) handleJobsMsg(msg jobsMsg) (tea.Model, tea.Cmd) {
 	}
 	if !msg.append {
 		m.loadingJobs = false
+		m.jobsErr = nil
 	}
 	m.consecutiveErrors = 0
 
@@ -2297,8 +2298,7 @@ func (m model) handleReconnectMsg(msg reconnectMsg) (tea.Model, tea.Cmd) {
 // refill. Mutates loadingJobs when it dispatches.
 func (m *model) maybeResizeRefill() tea.Cmd {
 	if m.loadingMore || m.loadingJobs ||
-		len(m.jobs) == 0 || !m.hasMore ||
-		m.activeBranchFilter == branchNone {
+		len(m.jobs) == 0 || !m.hasMore {
 		return nil
 	}
 	visibleRows := m.queueVisibleRows()
@@ -2449,6 +2449,7 @@ func (m model) handleJobsErrMsg(
 		return m, nil
 	}
 	m.err = msg.err
+	m.jobsErr = msg.err
 	m.loadingJobs = false
 	if cmd := m.handleConnectionError(msg.err); cmd != nil {
 		return m, cmd

@@ -788,6 +788,24 @@ func TestUsageFromSessionPayloadCostShapes(t *testing.T) {
 			body:      `{"has_token_data":false,"has_cost":false}`,
 			wantNoUse: true,
 		},
+		{
+			name: "zero token counts are data, not a schema error",
+			body: `{"has_token_data":true,"total_output_tokens":0,` +
+				`"peak_context_tokens":0,"has_cost":false}`,
+			wantNoUse: true,
+		},
+		{
+			name: "output without peak context keeps its cost",
+			body: `{"has_token_data":true,"total_output_tokens":120,` +
+				`"peak_context_tokens":0,"cost":{"microdollars":5000},"has_cost":true}`,
+			wantCost: true,
+			wantUSD:  0.005,
+		},
+		{
+			name:    "token data without an input-side count is a schema error",
+			body:    `{"has_token_data":true,"total_output_tokens":120,"has_cost":false}`,
+			wantErr: "missing token counts",
+		},
 	}
 
 	for _, tt := range tests {
@@ -952,10 +970,283 @@ func TestFetchForSessionTimeoutDoesNotWaitForInheritedPipes(t *testing.T) {
 func TestFetchForSessionReturnsUsageWhenHelperKeepsPipesOpen(t *testing.T) {
 	installPipeHoldingAgentsview(t, true)
 
-	result := waitForFetch(t, fetchInBackground(FetchConfig{Timeout: 10 * time.Second}))
+	// Allow the real subprocess tree to start on loaded runners. WaitDelay
+	// still bounds the inherited pipe wait after the launcher exits.
+	result := waitForFetch(t, fetchInBackground(FetchConfig{}))
 
 	require.NoError(t, result.err)
 	require.NotNil(t, result.usage)
 	assert.Equal(t, int64(42), result.usage.OutputTokens)
 	assert.InDelta(t, 0.07, result.usage.CostUSD, 1e-9)
+}
+
+func TestLookupSessionUsageHTTPSeparatesUnindexedFromUnusedSessions(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		status   int
+		body     string
+		wantErr  error
+		wantCost float64
+	}{
+		{name: "not indexed", status: http.StatusNotFound},
+		{
+			name:   "found without usage",
+			status: http.StatusOK,
+			body: `{"session_id":"codex:s","agent":"codex","total_output_tokens":0,` +
+				`"peak_context_tokens":0,"has_token_data":false,"cost":{"microdollars":0},` +
+				`"has_cost":false,"models":[],"unpriced_models":[],"breakdown_count":0,` +
+				`"breakdown":[],"server_running":true}`,
+			wantErr: ErrSessionWithoutUsage,
+		},
+		{
+			name:   "found with zero token counts",
+			status: http.StatusOK,
+			body: `{"session_id":"s","total_output_tokens":0,"peak_context_tokens":0,` +
+				`"has_token_data":true,"has_cost":false}`,
+			wantErr: ErrSessionWithoutUsage,
+		},
+		{
+			name:   "found with usage",
+			status: http.StatusOK,
+			body: `{"session_id":"s","total_output_tokens":40,"peak_context_tokens":900,` +
+				`"has_token_data":true,"cost":{"microdollars":21000},"has_cost":true}`,
+			wantCost: 0.021,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+				fmt.Fprint(w, tc.body)
+			}))
+			t.Cleanup(server.Close)
+			cfg := FetchConfig{Endpoint: server.URL + "/usage/{session_id}", Timeout: time.Second}
+
+			usage, err := LookupSessionUsage(t.Context(), "s", cfg)
+			if tc.wantErr != nil {
+				require.ErrorIs(t, err, tc.wantErr)
+				assert.Nil(t, usage)
+				// The fetch wrapper keeps reporting a session without usage as nil.
+				usage, err = FetchForSessionWithConfig(t.Context(), "s", cfg)
+				require.NoError(t, err)
+				assert.Nil(t, usage)
+				return
+			}
+			require.NoError(t, err)
+			if tc.wantCost == 0 {
+				assert.Nil(t, usage)
+				return
+			}
+			require.NotNil(t, usage)
+			assert.InDelta(t, tc.wantCost, usage.CostUSD, 1e-9)
+		})
+	}
+}
+
+func TestLookupSessionUsageAgentsViewReportsSessionWithoutUsage(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/api/v1/sessions/s/usage", r.URL.Path)
+		fmt.Fprint(w, `{"session_id":"s","total_output_tokens":0,"peak_context_tokens":0,`+
+			`"has_token_data":false,"has_cost":false}`)
+	}))
+	t.Cleanup(server.Close)
+
+	usage, err := LookupSessionUsage(t.Context(), "s", FetchConfig{
+		AgentsViewURL: server.URL, Timeout: time.Second,
+	})
+
+	require.ErrorIs(t, err, ErrSessionWithoutUsage)
+	assert.Nil(t, usage)
+}
+
+func TestLookupSessionUsageCLISeparatesUnindexedFromUnusedSessions(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		script  string
+		wantErr error
+	}{
+		{name: "session usage exit 2", script: `exit 2`},
+		{name: "session usage exit 3", script: `exit 3`, wantErr: ErrSessionWithoutUsage},
+		{
+			name:    "session usage zero counts",
+			script:  `echo '{"session_id":"s","total_output_tokens":0,"peak_context_tokens":0,"has_token_data":false,"has_cost":false}'`,
+			wantErr: ErrSessionWithoutUsage,
+		},
+		{
+			name: "token-use exit 2",
+			script: `if [ "$1" = "token-use" ]; then exit 2; fi
+echo "unknown command: session usage" >&2
+exit 1`,
+		},
+		{
+			name: "token-use exit 3",
+			script: `if [ "$1" = "token-use" ]; then exit 3; fi
+echo "unknown command: session usage" >&2
+exit 1`,
+			wantErr: ErrSessionWithoutUsage,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			installFakeAgentsview(t, "#!/bin/sh\n"+tc.script+"\n")
+
+			usage, err := LookupSessionUsage(t.Context(), "s", FetchConfig{})
+			assert.Nil(t, usage)
+			if tc.wantErr != nil {
+				require.ErrorIs(t, err, tc.wantErr)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestFetchForSessionsBatchFallbackClassification(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		script       string
+		sessionIDs   []string
+		timeout      time.Duration
+		wantFallback bool
+		maxDuration  time.Duration
+		wantError    string
+	}{
+		{
+			name:        "timeout",
+			script:      "while :; do :; done",
+			sessionIDs:  []string{"slow", "healthy-1", "healthy-2", "healthy-3"},
+			timeout:     time.Second,
+			maxDuration: 3 * time.Second,
+		},
+		{
+			name:         "unknown command",
+			script:       `echo 'unknown command "usage-batch" for "agentsview session"' >&2; exit 64`,
+			wantFallback: true,
+		},
+		{
+			name:         "unknown no-sync flag",
+			script:       `echo 'unknown flag: --no-sync' >&2; exit 64`,
+			wantFallback: true,
+		},
+		{
+			name:      "unrelated flag",
+			script:    `echo 'unknown flag: --other' >&2; exit 1`,
+			wantError: "unknown flag: --other",
+		},
+		{
+			name:      "unknown command with exit 2",
+			script:    `echo 'unknown command "usage-batch" for "agentsview session"' >&2; exit 2`,
+			wantError: `unknown command "usage-batch"`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			installFakeAgentsview(t, "#!/bin/sh\n"+tc.script+"\n")
+			sessionIDs := tc.sessionIDs
+			if sessionIDs == nil {
+				sessionIDs = []string{"a", "b"}
+			}
+			timeout := tc.timeout
+			if timeout == 0 {
+				timeout = time.Second
+			}
+			start := time.Now()
+			results, err := FetchForSessionsWithConfig(t.Context(), sessionIDs, FetchConfig{Timeout: timeout})
+			if tc.maxDuration > 0 {
+				assert.Less(t, time.Since(start), tc.maxDuration)
+			}
+			if tc.wantFallback {
+				require.ErrorIs(t, err, ErrBatchUnsupported)
+				assert.Nil(t, results)
+				return
+			}
+			require.Error(t, err)
+			require.NotErrorIs(t, err, ErrBatchUnsupported)
+			if tc.wantError != "" {
+				require.ErrorContains(t, err, tc.wantError)
+			}
+			assert.Nil(t, results)
+		})
+	}
+}
+
+func TestFetchForSessionsConfiguredHTTP(t *testing.T) {
+	calls := filepath.Join(t.TempDir(), "calls")
+	t.Setenv("BATCH_CALLS", calls)
+	installFakeAgentsview(t, `#!/bin/sh
+printf '%s\n' "$*" >> "$BATCH_CALLS"
+`)
+	for _, cfg := range []FetchConfig{
+		{Endpoint: "https://example.com/{session_id}"},
+		{AgentsViewURL: "https://agentsview.example.com"},
+	} {
+		results, err := FetchForSessionsWithConfig(t.Context(), []string{"a", "b"}, cfg)
+		require.ErrorIs(t, err, ErrBatchUnsupported)
+		assert.Nil(t, results)
+	}
+	_, err := os.Stat(calls)
+	assert.ErrorIs(t, err, os.ErrNotExist)
+}
+
+func TestFetchForSessionsBatchMapsRequestedIDs(t *testing.T) {
+	calls := filepath.Join(t.TempDir(), "calls")
+	t.Setenv("BATCH_CALLS", calls)
+	installFakeAgentsview(t, `#!/bin/sh
+printf '%s\n' "$*" >> "$BATCH_CALLS"
+echo '{"results":[{"requested_id":"b","exit_code":0,"usage":{"session_id":"resolved-b","cost_usd":0.23,"has_cost":true}},{"requested_id":"a","exit_code":0,"usage":{"cost_usd":0.11,"has_cost":true}},{"requested_id":"missing","exit_code":2},{"requested_id":"empty","exit_code":3},{"requested_id":"failed","exit_code":1,"error":"read failed"}]}'
+`)
+	results, err := FetchForSessionsWithConfig(
+		t.Context(), []string{"a", "b", "a", "missing", "empty", "failed"},
+		FetchConfig{Timeout: time.Second},
+	)
+	require.NoError(t, err)
+	require.Len(t, results, 5)
+	assert.InDelta(t, 0.11, results["a"].Usage.CostUSD, 1e-9)
+	assert.InDelta(t, 0.23, results["b"].Usage.CostUSD, 1e-9)
+	assert.Nil(t, results["missing"].Usage)
+	require.ErrorIs(t, results["empty"].Err, ErrSessionWithoutUsage)
+	require.ErrorContains(t, results["failed"].Err, "read failed")
+	invocations, err := os.ReadFile(calls)
+	require.NoError(t, err)
+	assert.Equal(t, "session usage-batch a b missing empty failed --format json --no-sync\n", string(invocations))
+}
+
+func TestFetchForSessionsBatchRejectsMalformedOutput(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		output string
+		want   string
+	}{
+		{
+			name:   "omitted requested result",
+			output: `{"results":[{"requested_id":"a","exit_code":2}]}`,
+			want:   `omitted session "b"`,
+		},
+		{
+			name:   "unexpected session",
+			output: `{"results":[{"requested_id":"other","exit_code":2}]}`,
+			want:   `unexpected session "other"`,
+		},
+		{
+			name:   "duplicate session",
+			output: `{"results":[{"requested_id":"a","exit_code":2},{"requested_id":"a","exit_code":2}]}`,
+			want:   `duplicate session "a"`,
+		},
+		{
+			name:   "success without usage",
+			output: `{"results":[{"requested_id":"a","exit_code":0,"usage":null},{"requested_id":"b","exit_code":2}]}`,
+			want:   `omitted usage for session "a"`,
+		},
+		{
+			name:   "invalid JSON",
+			output: `{`,
+			want:   "parse agentsview batch output",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			installFakeAgentsview(t, "#!/bin/sh\necho '"+tc.output+"'\n")
+			results, err := FetchForSessionsWithConfig(
+				t.Context(), []string{"a", "b"}, FetchConfig{Timeout: time.Second},
+			)
+			require.ErrorContains(t, err, tc.want)
+			assert.Nil(t, results)
+		})
+	}
 }

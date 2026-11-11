@@ -328,6 +328,11 @@ func (db *DB) ExportReviews(opts ExportReviewsOptions) (ExportReviewsPage, error
 }
 
 func (db *DB) queryExportReviewRows(opts ExportReviewsOptions, cursor *exportCursor) (*sql.Rows, error) {
+	query, args := exportReviewRowsQuery(opts, cursor)
+	return db.Query(query, args...)
+}
+
+func exportReviewRowsQuery(opts ExportReviewsOptions, cursor *exportCursor) (string, []any) {
 	outputExpr := "NULL"
 	if opts.Profile == ExportProfileContent {
 		outputExpr = "rv.structured_output"
@@ -335,8 +340,10 @@ func (db *DB) queryExportReviewRows(opts ExportReviewsOptions, cursor *exportCur
 	completedExpr := sqliteNormalizedTimestampExpr("rv.created_at")
 	var conditions []string
 	args := make([]any, 0)
+	// Unary + keeps status and closed indexes from displacing the completion
+	// index, which supplies export order without sorting before LIMIT.
 	conditions = append(conditions,
-		"j.status = 'done'",
+		"+j.status = 'done'",
 		"COALESCE(j.job_type, 'review') IN ('review','range','dirty','synthesis')",
 		"COALESCE(j.panel_role, '') != 'member'",
 		exportReviewHasVerdictExpr,
@@ -350,7 +357,7 @@ func (db *DB) queryExportReviewRows(opts ExportReviewsOptions, cursor *exportCur
 		args = append(args, opts.Until.UTC().Format(time.RFC3339))
 	}
 	if opts.ClosedOnly {
-		conditions = append(conditions, "rv.closed = 1")
+		conditions = append(conditions, "+rv.closed = 1")
 	}
 	if !opts.UpdatedSince.IsZero() {
 		conditions = append(conditions, sqliteNormalizedTimestampExpr(exportReviewUpdatedAtExpr)+" >= datetime(?)")
@@ -365,6 +372,10 @@ func (db *DB) queryExportReviewRows(opts ExportReviewsOptions, cursor *exportCur
 		args = append(args, opts.Project)
 	}
 	if cursor != nil {
+		// This superset bound lets SQLite seek idx_reviews_export_completed;
+		// the OR tie-break alone cannot seek the expression index.
+		conditions = append(conditions, completedExpr+" >= datetime(?)")
+		args = append(args, cursor.CompletedAt)
 		conditions = append(conditions, "("+completedExpr+" > datetime(?) OR ("+completedExpr+" = datetime(?) AND rv.uuid > ?))")
 		args = append(args, cursor.CompletedAt, cursor.CompletedAt, cursor.ReviewID)
 	}
@@ -390,7 +401,7 @@ func (db *DB) queryExportReviewRows(opts ExportReviewsOptions, cursor *exportCur
 		LEFT JOIN ci_pr_panels cp ON cp.panel_run_uuid = j.panel_run_uuid
 		WHERE ` + strings.Join(conditions, " AND ") + `
 		ORDER BY ` + completedExpr + ` ASC, rv.uuid ASC` + limitClause
-	return db.Query(query, args...)
+	return query, args
 }
 
 func scanExportReviewRow(rows *sql.Rows) (exportReviewRow, error) {

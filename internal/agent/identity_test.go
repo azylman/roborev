@@ -1,12 +1,14 @@
 package agent
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -14,6 +16,8 @@ import (
 
 	"go.kenn.io/roborev/internal/config"
 )
+
+var productionIdentityProbeTimeout = identityProbeTimeout
 
 // writeProbeScript creates a fake CLI that answers --version / -v with
 // versionLine. Positional args (version, v, or anything else) fail and,
@@ -212,6 +216,40 @@ func TestCommandIsUsableCursorCandidate_FailClosedOnUnknown(t *testing.T) {
 		assert.False(t, commandIsUsableCursorCandidate(bin),
 			"timeout must not classify binary as Cursor")
 	})
+}
+
+func TestIdentityProbeProductionTimeout(t *testing.T) {
+	prev := identityProbeTimeout
+	identityProbeTimeout = productionIdentityProbeTimeout
+	t.Cleanup(func() {
+		identityProbeTimeout = prev
+		clearIdentityProbeCache()
+	})
+	for _, tt := range []struct {
+		name  string
+		delay time.Duration
+		want  commandIdentity
+	}{
+		{name: "slow response", delay: 2500 * time.Millisecond, want: identityNotGrok},
+		{name: "response after deadline", delay: 6 * time.Second, want: identityUnknown},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				// Replace only subprocess I/O so startup and scheduling use no deadline budget.
+				probe := func(ctx context.Context, command, arg string) ([]byte, error) {
+					assert.Equal(t, "agent", command)
+					assert.Equal(t, "--version", arg)
+					select {
+					case <-time.After(tt.delay):
+						return []byte("cursor agent 1.0"), nil
+					case <-ctx.Done():
+						return nil, ctx.Err()
+					}
+				}
+				assert.Equal(t, tt.want, probeVersionIdentityWithRunner("agent", probe))
+			})
+		})
+	}
 }
 
 func TestIdentityProbe_OrphanPipeBounded(t *testing.T) {

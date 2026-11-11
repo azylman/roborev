@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,12 +19,34 @@ import (
 	"github.com/spf13/cobra"
 	gitrepo "go.kenn.io/kit/git/repo"
 
+	"go.kenn.io/roborev/internal/daemon"
 	"go.kenn.io/roborev/internal/storage"
 	"go.kenn.io/roborev/internal/telemetry"
 	"go.kenn.io/roborev/internal/tokens"
 	roborevclient "go.kenn.io/roborev/pkg/client"
 	"go.kenn.io/roborev/pkg/client/generated"
 )
+
+type cliHint struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+	Next    string `json:"next,omitempty"`
+}
+
+func openReviewHint(review storage.Review, command string) *cliHint {
+	if review.Job == nil || !review.Job.IsReadableReview() || review.Closed || review.Verdict() != storage.VerdictFail {
+		return nil
+	}
+	next := fmt.Sprintf("%s job comment --job %d -m \"<what changed>\" && %s job close %d", command, review.JobID, command, review.JobID)
+	if runtime.GOOS == "windows" {
+		next = fmt.Sprintf("%s job comment --job %d -m \"<what changed>\"; if ($LASTEXITCODE -eq 0) { %s job close %d }", command, review.JobID, command, review.JobID)
+	}
+	return &cliHint{
+		Code:    "review_open",
+		Message: fmt.Sprintf("review %d is open. After its findings are fixed or answered, record what changed and close it", review.JobID),
+		Next:    next,
+	}
+}
 
 // showPanelMember is one reviewer in the additive show --json panel block.
 type showPanelMember struct {
@@ -153,7 +176,7 @@ Examples:
 			// jobIDForPromptFallback carries the numeric job ID when the
 			// lookup is keyed by job ID, so a 404 from /api/review (no
 			// review row yet) can fall back to the job's stored prompt for
-			// queued/running jobs. -1 means "not applicable" (SHA lookups).
+			// jobs without reviews. -1 means "not applicable" (SHA lookups).
 			jobIDForPromptFallback := int64(-1)
 
 			if len(args) == 0 {
@@ -217,12 +240,10 @@ Examples:
 
 			var review storage.Review
 			if resp.StatusCode == http.StatusNotFound {
-				// Queued/running jobs don't have a review row yet, but the
-				// prompt was already recorded on the job at enqueue time.
-				// Mirror the TUI's fallback (handlers_review.go) so
-				// `show --prompt` works before the job completes.
+				// Active, failed, and canceled jobs can have stored prompts
+				// without a review row. Use the job for prompt requests.
 				fallback := showPrompt && jobIDForPromptFallback >= 0 &&
-					fetchQueuedJobPromptReview(client, addr, jobIDForPromptFallback, &review)
+					fetchJobPromptReview(client, addr, jobIDForPromptFallback, &review)
 				if !fallback {
 					return fmt.Errorf("no review found for %s", displayRef)
 				}
@@ -231,6 +252,16 @@ Examples:
 				return fmt.Errorf("daemon returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
 			} else if err := json.UnmarshalRead(resp.Body, &review); err != nil {
 				return fmt.Errorf("failed to parse response: %w", err)
+			}
+
+			var hint *cliHint
+			// Remote history is read-only, so it cannot run the suggested writes.
+			if !showPrompt && !ep.IsRemote() {
+				command := "roborev"
+				if serverAddr != "" {
+					command += " --server " + daemon.ShellEscape(ep.ConfigAddr())
+				}
+				hint = openReviewHint(review, command)
 			}
 
 			var allComments []storage.Response
@@ -248,8 +279,12 @@ Examples:
 					storage.Review
 					Comments []storage.Response `json:"comments,omitempty"`
 					Panel    *showPanelBlock    `json:"panel,omitempty"`
+					Hints    []cliHint          `json:"hints,omitempty"`
 				}
 				out := reviewWithComments{Review: review, Comments: allComments}
+				if hint != nil {
+					out.Hints = []cliHint{*hint}
+				}
 				if !ep.IsRemote() {
 					out.Comments = fetchShowComments(client, addr, review)
 				}
@@ -311,6 +346,10 @@ Examples:
 				}
 			}
 
+			if hint != nil {
+				fmt.Fprintf(cmd.ErrOrStderr(), "hint: %s: %s\n", hint.Message, hint.Next)
+			}
+
 			if !showPrompt && review.Job != nil && review.Job.IsReadableReview() {
 				reportCLIActionOutput(os.Stdout, telemetry.EventReviewViewed)
 			}
@@ -324,16 +363,10 @@ Examples:
 	return cmd
 }
 
-// fetchQueuedJobPromptReview looks up a job by ID and, if it is queued or
-// running and has a stored prompt, populates out with a minimal review built
-// from the job (Agent, Prompt, Job) and reports true. It reports false if the
-// job can't be found, isn't queued/running, or has no prompt yet — in which
-// case out is left untouched.
-//
-// This mirrors the TUI's queued-job prompt fallback (handlePromptKey in
-// cmd/roborev/tui/handlers_review.go), which reads Prompt straight off the
-// job object because no review row exists until the job completes.
-func fetchQueuedJobPromptReview(client *http.Client, addr string, jobID int64, out *storage.Review) bool {
+// fetchJobPromptReview populates out from an active, failed, or canceled
+// job's stored prompt when no review exists. It leaves out untouched when
+// the job is missing, has no prompt, or has an unsupported status.
+func fetchJobPromptReview(client *http.Client, addr string, jobID int64, out *storage.Review) bool {
 	resp, err := newDaemonAPI(addr, client).ListJobsRaw(context.Background(), &generated.ListJobsRequestOptions{Query: &generated.ListJobsQuery{ID: &jobID}})
 	if err != nil {
 		return false
@@ -354,7 +387,8 @@ func fetchQueuedJobPromptReview(client *http.Client, addr string, jobID int64, o
 	if job.Prompt == "" {
 		return false
 	}
-	if job.Status != storage.JobStatusQueued && job.Status != storage.JobStatusRunning {
+	if job.Status != storage.JobStatusQueued && job.Status != storage.JobStatusRunning &&
+		job.Status != storage.JobStatusFailed && job.Status != storage.JobStatusCanceled {
 		return false
 	}
 
@@ -374,7 +408,7 @@ func fetchQueuedJobPromptReview(client *http.Client, addr string, jobID int64, o
 // panel with >=50 rows is not truncated (the synthesis row also counts toward
 // the default cap).
 func fetchPanelMembers(client *http.Client, addr string, runUUID uuid.UUID) ([]storage.ReviewJob, error) {
-	resp, err := newDaemonAPI(addr, client).ListJobsRaw(context.Background(), &generated.ListJobsRequestOptions{Query: &generated.ListJobsQuery{PanelRun: new(runUUID), Limit: new(int64(0))}})
+	resp, err := newDaemonAPI(addr, client).ListJobsRaw(context.Background(), &generated.ListJobsRequestOptions{Query: &generated.ListJobsQuery{OmitStats: new(generated.ListJobsQueryOmitStatsTrue), PanelRun: new(runUUID), Limit: new(int64(0))}})
 	if err != nil {
 		return nil, err
 	}

@@ -63,7 +63,8 @@ Version 0.68.2 runs this migration automatically, including when upgrading
 directly from 0.67.0 or 0.68.0 without installing intermediate versions. If
 migration already completed in 0.68.1, there are no reviews left to migrate.
 Historical review archival, restoration, and verdict backfill process at most
-100 reviews per batch. Archival and verdict updates commit each batch;
+100 reviews per batch. These steps run on each start until they finish once;
+later starts skip them. Archival and verdict updates commit each batch;
 restoration saves each recovered review. Restarting after an interruption
 preserves completed work and continues with the remaining records. Startup
 restoration skips active reviews before loading their archived text and panel
@@ -117,6 +118,10 @@ If the daemon is stopped, start it:
 roborev daemon start
 ```
 
+If a v0.56 daemon is still running, startup reports the replacement's exit
+without waiting for the readiness timeout. Stop the legacy daemon manually
+before retrying.
+
 `roborev init` starts the daemon automatically, but it won't survive a reboot
 unless you've set up a launchd/systemd service. If the daemon was running but
 reviews still aren't appearing, read the saved daemon diagnostics:
@@ -154,6 +159,11 @@ attempts and waits. A server-required delay beyond the remaining budget surfaces
 the failure without retrying early. Writes such as comments and commit statuses
 are not retried.
 
+Secondary rate limits pause reads and writes across clients for the same
+credential and GitHub server. `Retry-After` takes precedence; otherwise, the
+pause lasts one minute. Requests during the pause fail with
+`rate limit cooldown` without contacting GitHub.
+
 Retry messages appear in `daemon.log`, including transient failures that
 recover. If all attempts fail, CI health and `errors.log` retain the failed
 operation and a safe category, such as `list pull requests: timeout` or
@@ -162,6 +172,9 @@ credentials are excluded from these summaries. Other failure details remain in
 the daemon log. The next successful poll clears the current failure and
 preserves error history; discovery continues to use previously known
 repositories when available.
+
+A failed lookup retries after 15 minutes, then 30, then hourly, so a token or
+access fix appears on the first poll after that window.
 
 Check the operation and category before changing configuration. For HTTP 401 or
 403, check the CI credential and its repository permissions. For rate limits,

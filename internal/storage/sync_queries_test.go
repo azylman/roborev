@@ -2,9 +2,13 @@ package storage
 
 import (
 	"database/sql"
+	"math"
 	"slices"
+	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
+	"uuid"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -28,10 +32,7 @@ func TestGetKnownJobUUIDs(t *testing.T) {
 		uuids, err := h.db.GetKnownJobUUIDs()
 		require.NoError(t, err, "GetKnownJobUUIDs failed: %v")
 
-		assert.Len(t, uuids, 2)
-
-		assert.Contains(t, uuids, *job1.UUID)
-		assert.Contains(t, uuids, *job2.UUID)
+		assert.Equal(t, map[uuid.UUID]struct{}{*job1.UUID: {}, *job2.UUID: {}}, uuids)
 	})
 }
 
@@ -758,4 +759,155 @@ func TestGetJobsToSync_IncludesSkipped(t *testing.T) {
 		}
 	}
 	assert.True(t, found, "expected skipped job to be syncable")
+}
+
+func TestReviewSyncAfterJobAcknowledgment(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		h := newSyncTestHelper(t)
+		assert := assert.New(t)
+		job := h.createCompletedJob("review-acknowledgment")
+		jobs, err := h.db.GetJobsToSync(h.machineID, 10)
+		require.NoError(t, err)
+		require.Len(t, jobs, 1)
+		require.NoError(t, h.db.MarkJobsSynced([]JobSyncMark{NewJobSyncMark(jobs[0])}))
+		var mirror sql.NullString
+		require.NoError(t, h.db.QueryRowContext(t.Context(), `SELECT job_synced_at FROM reviews WHERE job_id = ?`, job.ID).Scan(&mirror))
+		assert.False(mirror.Valid, "first pushes must leave unsynced reviews untouched")
+
+		// Start with a synced review so a later parent acknowledgment must
+		// republish only its metadata.
+		_, err = h.db.ExecContext(t.Context(), `UPDATE reviews SET synced_at = ? WHERE job_id = ?`, preciseTimestampAt(time.Now()), job.ID)
+		require.NoError(t, err)
+		time.Sleep(time.Millisecond)
+		require.NoError(t, h.db.MarkJobsSynced([]JobSyncMark{NewJobSyncMark(jobs[0])}))
+		reviews, err := h.db.GetReviewsToSync(h.machineID, 10)
+		require.NoError(t, err)
+		require.Len(t, reviews, 1)
+		assert.Equal(job.ID, reviews[0].JobID)
+		assert.True(reviews[0].MetadataOnly)
+	})
+}
+
+func TestSyncQueriesSeekPastCursor(t *testing.T) {
+	t.Parallel()
+	h := newSyncTestHelper(t)
+	for _, tc := range []struct {
+		name, query, alias, index, bounds string
+		args                              []any
+	}{
+		{"jobs", jobsToSyncQuery, "j", "idx_review_jobs_sync_pending", "id>?", []any{h.machineID, 25, 25}},
+		{"reviews", reviewsToSyncQuery, "r", "idx_reviews_sync_pending", "job_id>? AND job_id<?", []any{h.machineID, 25, 50, h.machineID, h.machineID, 25}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rows, err := h.db.QueryContext(t.Context(), "EXPLAIN QUERY PLAN "+tc.query, tc.args...)
+			require.NoError(t, err)
+			defer rows.Close()
+			var details []string
+			for rows.Next() {
+				var id, parent, unused int
+				var detail string
+				require.NoError(t, rows.Scan(&id, &parent, &unused, &detail))
+				details = append(details, detail)
+			}
+			require.NoError(t, rows.Err())
+			plan := strings.Join(details, "\n")
+			assert.Contains(t, plan, "SEARCH "+tc.alias+" ")
+			assert.Contains(t, plan, "USING INDEX "+tc.index)
+			assert.Contains(t, plan, tc.bounds)
+			assert.NotContains(t, plan, "SCAN j")
+			assert.NotContains(t, plan, "SCAN r")
+			assert.NotContains(t, plan, "TEMP B-TREE FOR ORDER BY")
+		})
+	}
+}
+
+func TestSyncQueriesPageHistory(t *testing.T) {
+	t.Parallel()
+	h := newSyncTestHelper(t)
+	checks := assert.New(t)
+	jobs := createSyncHistory(t, h.db, h.repo.ID, 60)
+	var want []int64
+	for _, job := range jobs {
+		want = append(want, job.ID)
+	}
+
+	// Leave jobs unmarked while paging so only the cursor skips earlier rows.
+	var jobCursor int64
+	var seenJobs []int64
+	var marks []JobSyncMark
+	for range 3 {
+		batch, err := h.db.jobsToSync(h.machineID, jobCursor, 25)
+		require.NoError(t, err)
+		require.NotEmpty(t, batch)
+		checks.Greater(batch[0].ID, jobCursor)
+		for _, job := range batch {
+			seenJobs = append(seenJobs, job.ID)
+			marks = append(marks, NewJobSyncMark(job))
+		}
+		jobCursor = batch[len(batch)-1].ID
+	}
+	checks.Equal(want, seenJobs)
+	pendingJobs, err := h.db.jobsToSync(h.machineID, jobCursor, 25)
+	require.NoError(t, err)
+	checks.Empty(pendingJobs)
+
+	// Reviews become eligible after their jobs upload. Leave them unmarked too.
+	require.NoError(t, h.db.MarkJobsSynced(marks))
+	var reviewJobCursor int64
+	var seenReviewJobs []int64
+	for range 3 {
+		reviews, err := h.db.reviewsToSync(h.machineID, reviewJobCursor, math.MaxInt64, 25)
+		require.NoError(t, err)
+		require.NotEmpty(t, reviews)
+		checks.Greater(reviews[0].JobID, reviewJobCursor)
+		for _, review := range reviews {
+			seenReviewJobs = append(seenReviewJobs, review.JobID)
+		}
+		reviewJobCursor = reviews[len(reviews)-1].JobID
+	}
+	checks.Equal(want, seenReviewJobs)
+	pendingReviews, err := h.db.reviewsToSync(h.machineID, reviewJobCursor, math.MaxInt64, 25)
+	require.NoError(t, err)
+	checks.Empty(pendingReviews)
+
+	t.Run("review bounds and short-page cursor jumps", func(t *testing.T) {
+		h := newSyncTestHelper(t)
+		assert := assert.New(t)
+		jobs := createSyncJobs(t, h.db, h.repo.ID, 6)
+		for _, i := range []int{0, 3, 5} {
+			failed, err := h.db.FailJob(jobs[i].ID, "worker", "test failure")
+			require.NoError(t, err)
+			require.True(t, failed)
+		}
+		// Review IDs run opposite to job IDs.
+		for _, i := range []int{4, 2, 1} {
+			require.NoError(t, completeReviewFixture(h.db, jobs[i].ID, "test", "prompt", "output"))
+		}
+		for _, job := range jobs {
+			require.NoError(t, h.db.MarkJobSynced(job.ID))
+		}
+
+		cur := pushCursor{}
+		reviews, err := h.db.reviewsToSync(h.machineID, cur.reviewJob, jobs[0].ID, syncBatchSize)
+		require.NoError(t, err)
+		assert.Empty(reviews)
+		cur.advanceReviews(reviews, jobs[0].ID)
+		assert.Equal(jobs[0].ID, cur.reviewJob, "empty pages must skip the examined range")
+
+		reviews, err = h.db.reviewsToSync(h.machineID, cur.reviewJob, jobs[3].ID, syncBatchSize)
+		require.NoError(t, err)
+		require.Len(t, reviews, 2)
+		assert.Equal(jobs[1].ID, reviews[0].JobID)
+		assert.Equal(jobs[2].ID, reviews[1].JobID)
+		cur.advanceReviews(reviews, jobs[3].ID)
+		assert.Equal(jobs[3].ID, cur.reviewJob, "short pages must skip trailing reviewless jobs")
+
+		reviews, err = h.db.reviewsToSync(h.machineID, cur.reviewJob, jobs[5].ID, syncBatchSize)
+		require.NoError(t, err)
+		require.Len(t, reviews, 1)
+		assert.Equal(jobs[4].ID, reviews[0].JobID)
+		cur.advanceReviews(reviews, jobs[5].ID)
+		assert.Equal(jobs[5].ID, cur.reviewJob, "short pages must skip trailing reviewless jobs")
+	})
 }

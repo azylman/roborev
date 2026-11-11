@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"path/filepath"
+	"slices"
 	"testing"
+	"uuid"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -114,7 +116,11 @@ func TestOpenBaselinesDatabaseFromBeforeNumberedMigrations(t *testing.T) {
 	db, err := Open(path)
 	require.NoError(t, err)
 	defer db.Close()
-	assert.Equal(t, []int{1, 2, 3, 4, 5}, appliedVersions(t, db))
+	var versions []int
+	for _, migration := range schemaMigrations {
+		versions = append(versions, migration.version)
+	}
+	assert.Equal(t, versions, appliedVersions(t, db))
 	var name string
 	require.NoError(t, db.QueryRowContext(t.Context(), `SELECT name FROM repos WHERE root_path = '/synthetic/repo'`).Scan(&name))
 	assert.Equal(t, "repo", name)
@@ -187,37 +193,109 @@ func TestCIPanelRetireReasonMigration(t *testing.T) {
 	}
 }
 
-func TestCIPanelPRHeadIndexMigration(t *testing.T) {
+func TestIndexMigrations(t *testing.T) {
 	t.Parallel()
-	db := openUnmigratedDB(t)
-	require.NoError(t, db.runSchemaMigrations(t.Context(), schemaMigrations[:3]))
-
-	for range 2 {
-		require.NoError(t, db.runSchemaMigrations(t.Context(), schemaMigrations[:4]))
-		var indexSQL string
-		require.NoError(t, db.QueryRowContext(t.Context(), `SELECT sql FROM sqlite_master
-			WHERE type = 'index' AND name = 'idx_ci_panels_pr_head'`).Scan(&indexSQL))
-		assert.Contains(t, indexSQL, "ON ci_pr_panels(github_repo, pr_number, head_sha)")
-		assert.Equal(t, []int{1, 2, 3, 4}, appliedVersions(t, db))
-		// Simulate interruption after creating the index, before recording it.
-		_, err := db.ExecContext(t.Context(), `DELETE FROM schema_migrations WHERE version = 4`)
-		require.NoError(t, err)
+	for _, tc := range []struct {
+		name     string
+		version  int
+		index    string
+		fragment string
+	}{
+		{"CI panel PR head", 4, "idx_ci_panels_pr_head", "ON ci_pr_panels(github_repo, pr_number, head_sha)"},
+		{"token cost started", 5, "idx_review_jobs_source_started", "source_machine_id, " + sqliteNormalizedTimestampExpr("started_at")},
+		{"summary repo window", 6, "idx_review_jobs_repo_enqueued", "repo_id, " + sqliteNormalizedTimestampExpr("enqueued_at")},
+		{"review export completion", 7, "idx_reviews_export_completed", "ON reviews(" + sqliteNormalizedTimestampExpr("created_at")},
+		{"search changes", 8, "idx_review_jobs_commit_id", "ON review_jobs(commit_id)"},
+		{"cost aggregate", 9, "idx_review_jobs_cost", "ON review_jobs(repo_id, branch, CASE WHEN"},
+		{"open failed reviews", 10, "idx_reviews_open_failed", "ON reviews(job_id) WHERE closed = 0 AND verdict_bool = 0"},
+		{"CI panel run", 11, "idx_ci_panels_panel_run", "ON ci_pr_panels(panel_run_uuid)"},
+		{"branch list position", 12, "idx_review_jobs_branch_position", "branch, " + sqliteNormalizedTimestampExpr("enqueued_at") + " DESC, id DESC"},
+		{"queue stats closed state", 13, "idx_review_jobs_queue_stats", "panel_role, review_closed)"},
+		{"closed list position", 12, "idx_review_jobs_closed_position", "DESC, id DESC) WHERE review_closed = 1"},
+		{"pending jobs", 14, "idx_review_jobs_sync_pending", "ON review_jobs(source_machine_id, id) WHERE status IN"},
+		{"pending reviews", 14, "idx_reviews_sync_pending", "ON reviews(job_id) WHERE uuid IS NOT NULL"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := openUnmigratedDB(t)
+			migrations := schemaMigrations[:tc.version]
+			require.NoError(t, db.runSchemaMigrations(t.Context(), migrations[:len(migrations)-1]))
+			var versions []int
+			for _, migration := range migrations {
+				versions = append(versions, migration.version)
+			}
+			for range 2 {
+				require.NoError(t, db.runSchemaMigrations(t.Context(), migrations))
+				var indexSQL string
+				require.NoError(t, db.QueryRowContext(t.Context(), `SELECT sql FROM sqlite_master
+					WHERE type = 'index' AND name = ?`, tc.index).Scan(&indexSQL))
+				assert.Contains(t, indexSQL, tc.fragment)
+				assert.Equal(t, versions, appliedVersions(t, db))
+				// Retry after creating the index but before recording the migration.
+				_, err := db.ExecContext(t.Context(), `DELETE FROM schema_migrations WHERE version = ?`, tc.version)
+				require.NoError(t, err)
+			}
+		})
 	}
 }
 
-func TestTokenCostStartedIndexMigration(t *testing.T) {
+func TestQueueListPositionMigrationBackfill(t *testing.T) {
 	t.Parallel()
 	db := openUnmigratedDB(t)
-	require.NoError(t, db.runSchemaMigrations(t.Context(), schemaMigrations[:4]))
-
+	require.NoError(t, db.runSchemaMigrations(t.Context(), schemaMigrations[:11]))
+	_, jobs := seedJobs(t, db, "/tmp/migration-closed", 3)
+	for _, job := range jobs {
+		setStatus(t, db, job.ID, JobStatusDone)
+	}
+	_, err := db.ExecContext(t.Context(), `INSERT INTO reviews(job_id, agent, output, closed) VALUES (?, 'test', '', 1), (?, 'test', '', 0)`, jobs[0].ID, jobs[1].ID)
+	require.NoError(t, err)
+	require.NoError(t, db.runSchemaMigrations(t.Context(), schemaMigrations))
 	for range 2 {
-		require.NoError(t, db.runSchemaMigrations(t.Context(), schemaMigrations))
-		var indexSQL string
-		require.NoError(t, db.QueryRowContext(t.Context(), `SELECT sql FROM sqlite_master
-			WHERE type = 'index' AND name = 'idx_review_jobs_source_started'`).Scan(&indexSQL))
-		assert.Equal(t, []int{1, 2, 3, 4, 5}, appliedVersions(t, db))
-		// Simulate interruption after creating the index, before recording it.
-		_, err := db.ExecContext(t.Context(), `DELETE FROM schema_migrations WHERE version = 5`)
+		var flags string
+		require.NoError(t, db.QueryRowContext(t.Context(), `SELECT group_concat(review_closed) FROM (SELECT review_closed FROM review_jobs ORDER BY id)`).Scan(&flags))
+		assert.Equal(t, "1,0,0", flags)
+		require.NoError(t, migrateQueueListPositionIndexes(t.Context(), db))
+	}
+}
+
+func TestSyncPendingMigrationBackfill(t *testing.T) {
+	t.Parallel()
+	assert := assert.New(t)
+	require.NoError(t, registerContentFunctions())
+	db := openUnmigratedDB(t)
+	migrationIndex := slices.IndexFunc(schemaMigrations, func(m schemaMigration) bool { return m.version == 14 })
+	require.NotEqual(t, -1, migrationIndex)
+	require.NoError(t, db.runSchemaMigrations(t.Context(), schemaMigrations[:migrationIndex]))
+	machineID, err := db.GetMachineID()
+	require.NoError(t, err)
+	_, jobs := seedJobs(t, db, t.TempDir(), 4)
+	cases := []struct {
+		name            string
+		sourceMachineID uuid.UUID
+		jobSyncedAt     any
+		reviewSyncedAt  any
+		wantMirror      sql.NullString
+	}{
+		{"local review synced after job", machineID, "2024-01-02 00:00:00", "2024-01-03 00:00:00", sql.NullString{String: "2024-01-02 00:00:00", Valid: true}},
+		{"local review synced before job", machineID, "2024-01-02 00:00:00", "2024-01-01 00:00:00", sql.NullString{String: "2024-01-02 00:00:00", Valid: true}},
+		{"unsynced local job and review", machineID, nil, nil, sql.NullString{}},
+		{"remote job and review", testUUID("remote-machine"), "2024-01-02 00:00:00", "2024-01-01 00:00:00", sql.NullString{}},
+	}
+	for i, tc := range cases {
+		job := jobs[i]
+		_, err := db.ExecContext(t.Context(), `UPDATE review_jobs SET status = 'done', uuid = ?, source_machine_id = ?,
+			updated_at = '2024-01-01 00:00:00', synced_at = ? WHERE id = ?`, testUUID(job.GitRef), tc.sourceMachineID, tc.jobSyncedAt, job.ID)
 		require.NoError(t, err)
+		_, err = db.ExecContext(t.Context(), `INSERT INTO reviews(job_id, agent, output, structured_output, uuid, updated_by_machine_id, updated_at, synced_at)
+			VALUES (?, 'test', '', ?, ?, ?, '2024-01-01 00:00:00', ?)`, job.ID, reviewFixtureJSON("output"), testUUID("review-"+job.GitRef), machineID, tc.reviewSyncedAt)
+		require.NoError(t, err)
+	}
+	require.NoError(t, db.runSchemaMigrations(t.Context(), schemaMigrations))
+	for range 2 {
+		for i, tc := range cases {
+			var mirror sql.NullString
+			require.NoError(t, db.QueryRowContext(t.Context(), `SELECT job_synced_at FROM reviews WHERE job_id = ?`, jobs[i].ID).Scan(&mirror))
+			assert.Equal(tc.wantMirror, mirror, tc.name)
+		}
+		require.NoError(t, migrateSyncPendingIndexes(t.Context(), db))
 	}
 }

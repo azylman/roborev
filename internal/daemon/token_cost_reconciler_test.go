@@ -1,9 +1,14 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
+	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -12,6 +17,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"go.kenn.io/roborev/internal/config"
 	"go.kenn.io/roborev/internal/storage"
 	"go.kenn.io/roborev/internal/testutil"
 	"go.kenn.io/roborev/internal/tokens"
@@ -99,7 +105,7 @@ func TestTokenCostReconcilerAggregatesPlanPhaseSessions(t *testing.T) {
 		return &tokens.Usage{CostUSD: costs[sessionID], HasCost: true}, nil
 	}
 
-	resolved, err := tc.Pool.reconcileTokenCostCandidate(t.Context(), *candidate)
+	resolved, err := tc.Pool.reconcileTokenCostCandidate(t.Context(), *candidate, tc.Pool.fetchTokenUsage)
 	require.NoError(t, err)
 	assert.True(t, resolved)
 	assert.ElementsMatch(t, []string{"planner-session", "implementation-session"}, fetchedSessions)
@@ -127,7 +133,7 @@ func TestTokenCostReconcilerPreservesStoredCountsWhenPlanPhaseHasNoCounts(t *tes
 		return &tokens.Usage{InputTokens: 200, OutputTokens: 25, CostUSD: 0.29, HasCost: true}, nil
 	}
 
-	resolved, err := tc.Pool.reconcileTokenCostCandidate(t.Context(), *candidate)
+	resolved, err := tc.Pool.reconcileTokenCostCandidate(t.Context(), *candidate, tc.Pool.fetchTokenUsage)
 	require.NoError(t, err)
 	assert.True(t, resolved)
 	updated, err := tc.DB.GetJobByID(job.ID)
@@ -153,7 +159,7 @@ func TestTokenCostReconcilerPricesAvailableSessionWithMissingPlanSession(t *test
 		return &tokens.Usage{InputTokens: 200, OutputTokens: 25, CostUSD: 0.29, HasCost: true}, nil
 	}
 
-	resolved, err := tc.Pool.reconcileTokenCostCandidate(t.Context(), *candidate)
+	resolved, err := tc.Pool.reconcileTokenCostCandidate(t.Context(), *candidate, tc.Pool.fetchTokenUsage)
 	require.NoError(t, err)
 	assert.True(t, resolved, "the available implementation session is priced")
 	assert.Equal(t, 1, fetches)
@@ -359,6 +365,156 @@ func TestTokenCostReconcilerBacksOffRepeatedMisses(t *testing.T) {
 	})
 }
 
+// startQuietTokenCostReconciler runs only the cost scan, once a minute, so a
+// synctest bubble counts provider lookups without worker or log-scan noise.
+func startQuietTokenCostReconciler(t *testing.T, pool *WorkerPool) {
+	t.Helper()
+	pool.tokenCostScanInterval = time.Minute
+	pool.tokenCostRetryInterval = time.Hour
+	// Keep worker lock retries and overlapping log scans from delaying cost
+	// scans; SQLite retry sleeps on macOS let synctest.Wait return early.
+	pool.numWorkers = 0
+	pool.tokenUsageLogScanInterval = 24 * time.Hour
+	pool.Start()
+}
+
+func TestTokenCostReconcilerStopsAskingAboutSessionWithoutUsage(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		tc := newWorkerTestContext(t, 1)
+		job := seedTokenCostCandidate(t, tc, "empty-session", `{}`)
+		var lookups atomic.Int32
+		tc.Pool.tokenUsageFetcher = func(context.Context, string) (*tokens.Usage, error) {
+			lookups.Add(1)
+			return nil, tokens.ErrSessionWithoutUsage
+		}
+		startQuietTokenCostReconciler(t, tc.Pool)
+		t.Cleanup(tc.Pool.Stop)
+
+		// Lookups run at minutes 0, 1, 3, 7, and 15. The answer at minute 15
+		// repeats the one before it and comes 15 minutes after the job
+		// finished, so it is final.
+		time.Sleep(time.Hour)
+		synctest.Wait()
+		assert.Equal(t, int32(5), lookups.Load())
+
+		time.Sleep(6 * 24 * time.Hour)
+		synctest.Wait()
+		assert.Equal(t, int32(5), lookups.Load())
+		updated, err := tc.DB.GetJobByID(job.ID)
+		require.NoError(t, err)
+		assert.Nil(t, tokens.ParseJSON(updated.TokenUsage))
+	})
+}
+
+func TestTokenCostReconcilerPricesUsageThatArrivesAfterEmptyAnswers(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		tc := newWorkerTestContext(t, 1)
+		job := seedTokenCostCandidate(t, tc, "arriving-session", `{}`)
+		var indexed atomic.Bool
+		tc.Pool.tokenUsageFetcher = func(context.Context, string) (*tokens.Usage, error) {
+			if !indexed.Load() {
+				return nil, tokens.ErrSessionWithoutUsage
+			}
+			return &tokens.Usage{OutputTokens: 64, HasCost: true, CostUSD: 0.08}, nil
+		}
+		startQuietTokenCostReconciler(t, tc.Pool)
+		t.Cleanup(tc.Pool.Stop)
+
+		// Empty answers at minutes 0, 1, and 3 all come within 15 minutes of
+		// the job finishing, so the lookup at minute 7 still runs.
+		time.Sleep(5 * time.Minute)
+		synctest.Wait()
+		indexed.Store(true)
+		time.Sleep(3 * time.Minute)
+		synctest.Wait()
+
+		updated, err := tc.DB.GetJobByID(job.ID)
+		require.NoError(t, err)
+		usage := tokens.ParseJSON(updated.TokenUsage)
+		require.NotNil(t, usage)
+		assert.True(t, usage.HasCost)
+		assert.InDelta(t, 0.08, usage.CostUSD, 1e-9)
+	})
+}
+
+func TestTokenCostReconcilerKeepsAskingWhenEmptyAnswerMovesToAnotherPhase(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		tc := newWorkerTestContext(t, 1)
+		job := seedTokenCostCandidate(t, tc, "implementation-session", `{"input_tokens":300,"total_output_tokens":40,"provider_session_ids":["planner-session","implementation-session"],"expected_provider_sessions":2}`)
+		var plannerIndexed, implementationIndexed atomic.Bool
+		tc.Pool.tokenUsageFetcher = func(_ context.Context, sessionID string) (*tokens.Usage, error) {
+			switch sessionID {
+			case "planner-session":
+				if !plannerIndexed.Load() {
+					return nil, tokens.ErrSessionWithoutUsage
+				}
+				return &tokens.Usage{CostUSD: 0.13, HasCost: true}, nil
+			case "implementation-session":
+				if !implementationIndexed.Load() {
+					return nil, tokens.ErrSessionWithoutUsage
+				}
+				return &tokens.Usage{CostUSD: 0.29, HasCost: true}, nil
+			}
+			return nil, fmt.Errorf("unexpected session %q", sessionID)
+		}
+		startQuietTokenCostReconciler(t, tc.Pool)
+		t.Cleanup(tc.Pool.Stop)
+
+		// The planner comes back empty at minutes 0, 1, 3, and 7.
+		time.Sleep(10 * time.Minute)
+		synctest.Wait()
+		// At minute 15 the planner has usage and the implementation session
+		// is empty for the first time, so the lookup at minute 31 still runs.
+		plannerIndexed.Store(true)
+		time.Sleep(10 * time.Minute)
+		synctest.Wait()
+		implementationIndexed.Store(true)
+		time.Sleep(15 * time.Minute)
+		synctest.Wait()
+
+		updated, err := tc.DB.GetJobByID(job.ID)
+		require.NoError(t, err)
+		usage := tokens.ParseJSON(updated.TokenUsage)
+		require.NotNil(t, usage)
+		assert.True(t, usage.HasCost)
+		assert.InDelta(t, 0.42, usage.CostUSD, 1e-9)
+	})
+}
+
+func TestTokenCostReconcilerBackoffSurvivesRestart(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		tc := newWorkerTestContext(t, 1)
+		seedTokenCostCandidate(t, tc, "unindexed-session", `{}`)
+		var lookups atomic.Int32
+		fetcher := func(context.Context, string) (*tokens.Usage, error) {
+			lookups.Add(1)
+			return nil, nil
+		}
+		tc.Pool.tokenUsageFetcher = fetcher
+		startQuietTokenCostReconciler(t, tc.Pool)
+
+		// Lookups at minutes 0, 1, and 3 schedule the next one for minute 7.
+		time.Sleep(3*time.Minute + 30*time.Second)
+		synctest.Wait()
+		require.Equal(t, int32(3), lookups.Load())
+		tc.Pool.Stop()
+
+		cfg := config.DefaultConfig()
+		restarted := NewWorkerPool(tc.DB, NewStaticConfig(cfg), cfg.MaxWorkers, tc.Broadcaster, nil, nil)
+		restarted.tokenUsageFetcher = fetcher
+		startQuietTokenCostReconciler(t, restarted)
+		t.Cleanup(restarted.Stop)
+
+		time.Sleep(3*time.Minute + 30*time.Second)
+		synctest.Wait()
+		assert.Equal(t, int32(3), lookups.Load(), "restart must not reset the backoff")
+
+		time.Sleep(time.Minute)
+		synctest.Wait()
+		assert.Equal(t, int32(4), lookups.Load())
+	})
+}
+
 func TestTokenCostReconcilerShutdownCancelsProviderLookup(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		tc := newWorkerTestContext(t, 1)
@@ -456,4 +612,184 @@ func seedTokenCostCandidate(
 		require.True(t, updated)
 	}
 	return job
+}
+
+func TestTokenCostPageBatchesPartialCandidate(t *testing.T) {
+	worker := newWorkerTestContext(t, 1)
+	job := seedTokenCostCandidate(t, worker, "implementation-session", `{"input_tokens":300,"total_output_tokens":40,"provider_session_ids":["implementation-session"],"expected_provider_sessions":2}`)
+	var calls [][]string
+	worker.Pool.tokenUsageBatchFetcher = func(_ context.Context, ids []string) (map[string]tokens.SessionUsageResult, error) {
+		calls = append(calls, ids)
+		return map[string]tokens.SessionUsageResult{"implementation-session": {Usage: &tokens.Usage{HasCost: true, CostUSD: 0.25}}}, nil
+	}
+	var individualCalls []string
+	worker.Pool.tokenUsageFetcher = func(_ context.Context, id string) (*tokens.Usage, error) {
+		individualCalls = append(individualCalls, id)
+		return nil, nil
+	}
+	assert.Zero(t, worker.Pool.reconcileTokenCostPage(t.Context(), 0))
+	assert.Equal(t, [][]string{{"implementation-session"}}, calls)
+	assert.Empty(t, individualCalls)
+	updated, err := worker.DB.GetJobByID(job.ID)
+	require.NoError(t, err)
+	usage := tokens.ParseJSON(updated.TokenUsage)
+	require.NotNil(t, usage)
+	assert.True(t, usage.HasCost)
+	assert.InDelta(t, 0.25, usage.CostUSD, 1e-9)
+}
+
+func tokenCostPageSessionIDs(count int) []string {
+	ids := make([]string, count)
+	for i := range count {
+		ids[i] = fmt.Sprintf("session-%d", i)
+	}
+	return ids
+}
+
+func TestTokenCostPageHandlesBatchFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name                    string
+		batchErr                error
+		individualCalls         []string
+		unpricedIDs             map[string]bool
+		individualTimeoutID     string
+		individualUnavailableID string
+		logMessage              string
+		cancelBatch             bool
+		wantDue                 int
+	}{
+		{
+			name:                "timeout retries sessions individually",
+			batchErr:            context.DeadlineExceeded,
+			individualCalls:     []string{"slow", "healthy"},
+			unpricedIDs:         map[string]bool{"slow": true},
+			individualTimeoutID: "slow",
+			logMessage:          "batch usage lookup",
+			wantDue:             0,
+		},
+		{
+			name:                    "provider unavailable stops page",
+			batchErr:                tokens.ErrBatchUnsupported,
+			individualCalls:         []string{"slow"},
+			unpricedIDs:             map[string]bool{"slow": true, "healthy": true},
+			individualUnavailableID: "slow",
+			logMessage:              "token cost reconciliation: usage provider unavailable",
+			wantDue:                 2,
+		},
+		{
+			name:        "batch cancellation leaves candidates due",
+			cancelBatch: true,
+			wantDue:     2,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			worker := newWorkerTestContext(t, 1)
+			slow := seedTokenCostCandidate(t, worker, "slow", `{}`)
+			healthy := seedTokenCostCandidate(t, worker, "healthy", `{}`)
+			ctx := t.Context()
+			cancel := func() {}
+			if tc.cancelBatch {
+				ctx, cancel = context.WithCancel(t.Context())
+			}
+			defer cancel()
+			var logOutput bytes.Buffer
+			origOutput := log.Writer()
+			log.SetOutput(&logOutput)
+			t.Cleanup(func() { log.SetOutput(origOutput) })
+			var batches [][]string
+			worker.Pool.tokenUsageBatchFetcher = func(ctx context.Context, ids []string) (map[string]tokens.SessionUsageResult, error) {
+				batches = append(batches, ids)
+				if tc.cancelBatch {
+					cancel()
+					return nil, ctx.Err()
+				}
+				return nil, tc.batchErr
+			}
+			var individualCalls []string
+			worker.Pool.tokenUsageFetcher = func(_ context.Context, id string) (*tokens.Usage, error) {
+				individualCalls = append(individualCalls, id)
+				if id == tc.individualUnavailableID {
+					return nil, tokens.ErrUsageProviderUnavailable
+				}
+				if id == tc.individualTimeoutID {
+					return nil, context.DeadlineExceeded
+				}
+				return &tokens.Usage{HasCost: true, CostUSD: 0.37}, nil
+			}
+
+			assert.Zero(t, worker.Pool.reconcileTokenCostPage(ctx, 0))
+			if !tc.cancelBatch {
+				for id, job := range map[string]*storage.ReviewJob{"slow": slow, "healthy": healthy} {
+					updated, err := worker.DB.GetJobByID(job.ID)
+					require.NoError(t, err)
+					if tc.unpricedIDs[id] {
+						assert.Equal(t, "{}", updated.TokenUsage)
+						continue
+					}
+					usage := tokens.ParseJSON(updated.TokenUsage)
+					require.NotNil(t, usage)
+					assert.True(t, usage.HasCost)
+					assert.InDelta(t, 0.37, usage.CostUSD, 1e-9)
+				}
+			}
+			assert.Equal(t, [][]string{{"slow", "healthy"}}, batches)
+			assert.Equal(t, tc.individualCalls, individualCalls)
+			if tc.logMessage != "" {
+				assert.Contains(t, logOutput.String(), tc.logMessage)
+			}
+			due, err := worker.DB.ListDueTokenCostCandidates(
+				t.Context(), 0, 10,
+				time.Now().Add(-worker.Pool.tokenCostMaxCandidateAge), time.Now(),
+			)
+			require.NoError(t, err)
+			assert.Len(t, due, tc.wantDue)
+		})
+	}
+}
+
+func TestTokenCostPageRealBatchPages(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses shell scripts")
+	}
+	dir := t.TempDir()
+	calls := filepath.Join(dir, "calls")
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("CALLS", calls)
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> "$CALLS"
+shift 2
+printf '{"results":['
+sep=''
+while [ "$1" != --format ]; do
+  printf '%s{"requested_id":"%s","exit_code":0,"usage":{"has_cost":true,"cost_usd":0.25}}' "$sep" "$1"
+  sep=,
+  shift
+done
+printf ']}'
+`
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "agentsview"), []byte(script), 0o755))
+	worker := newWorkerTestContext(t, 1)
+	cfg := config.DefaultConfig()
+	cfg.Cost.Timeout = "1s"
+	worker.reconfigurePool(cfg)
+	ids := tokenCostPageSessionIDs(21)
+	var jobs []*storage.ReviewJob
+	for _, id := range ids {
+		jobs = append(jobs, seedTokenCostCandidate(t, worker, id, `{"total_output_tokens":40}`))
+	}
+	cursor := worker.Pool.reconcileTokenCostPage(t.Context(), 0)
+	require.Equal(t, jobs[19].ID, cursor)
+	require.Zero(t, worker.Pool.reconcileTokenCostPage(t.Context(), cursor))
+	data, err := os.ReadFile(calls)
+	require.NoError(t, err)
+	assert.Equal(t, "session usage-batch "+strings.Join(ids[:20], " ")+" --format json --no-sync\nsession usage-batch "+ids[20]+" --format json --no-sync\n", string(data))
+	for _, job := range jobs {
+		updated, err := worker.DB.GetJobByID(job.ID)
+		require.NoError(t, err)
+		usage := tokens.ParseJSON(updated.TokenUsage)
+		require.NotNil(t, usage)
+		assert.Equal(t, int64(40), usage.OutputTokens)
+		assert.True(t, usage.HasCost)
+		assert.InDelta(t, 0.25, usage.CostUSD, 1e-9)
+	}
 }

@@ -128,6 +128,9 @@ go test ./...              # Run all tests
 go test ./internal/agent/  # Test specific package
 ```
 
+Run `make test-search-mirror-growth` for the `growth`-tagged mirror and feed
+checks, which use the release SQLite driver without race instrumentation.
+
 Ordinary unit tests are deterministic and offline. They do not authenticate to
 Codex, contact a model, or run the live skill conformance evaluation.
 
@@ -135,7 +138,12 @@ Codex, contact a model, or run the live skill conformance evaluation.
 
 CI uses GitHub-hosted `ubuntu-latest`, `macos-latest`, and `windows-2025`
 runners. Test jobs restore a daily Go module and build cache saved by main's
-test legs for each OS. Other jobs use the default `actions/setup-go` cache.
+test legs for each OS. Other jobs use the default `actions/setup-go` cache. The
+lint job also restores main's custom golangci-lint binary and analysis cache.
+
+The exceptions are the seconds-long `CI gate`, `go-changes`, and
+`Sibling pins on main` jobs. They run on the Namespace profile
+`namespace-profile-linux-1cpu` so they do not wait in the GitHub-hosted queue.
 
 Runner selection lives in `.github/workflows/ci.yml` and
 `.github/workflows/windows-migration.yml`. The PR dispatchers call the workflow

@@ -159,6 +159,10 @@ func listJobsQuery(values neturl.Values) *daemonclient.ListJobsQuery {
 	}
 	setStringParam("git_ref", &query.GitRef)
 	setStringParam("branch", &query.Branch)
+	if value := values.Get("branch_empty"); value != "" {
+		typed := daemonclient.ListJobsQueryBranchEmpty(value)
+		query.BranchEmpty = &typed
+	}
 	if value := values.Get("branch_include_empty"); value != "" {
 		typed := daemonclient.ListJobsQueryBranchIncludeEmpty(value)
 		query.BranchIncludeEmpty = &typed
@@ -172,6 +176,10 @@ func listJobsQuery(values neturl.Values) *daemonclient.ListJobsQuery {
 	if value := values.Get("hide_classify_jobs"); value != "" {
 		typed := daemonclient.ListJobsQueryHideClassifyJobs(value)
 		query.HideClassifyJobs = &typed
+	}
+	if value := values.Get("omit_stats"); value != "" {
+		typed := daemonclient.ListJobsQueryOmitStats(value)
+		query.OmitStats = &typed
 	}
 	if value := values.Get("omit_prompt"); value != "" {
 		typed := daemonclient.ListJobsQueryOmitPrompt(value)
@@ -199,31 +207,24 @@ func (m model) fetchJobs() tea.Cmd {
 	seq := m.fetchSeq
 
 	jobsCmd := func() tea.Msg {
-		// Build URL with server-side filters where possible, falling back to
-		// limit=0 (no pagination) only when client-side filtering is required.
+		// Build a paginated query with server-side filters.
 		params := neturl.Values{}
 
 		// Repo filter: one ?repo= per path. A display name spanning multiple
 		// repos is scoped server-side via an IN clause, so it paginates like a
 		// single repo rather than loading every job for client-side filtering.
-		needsAllJobs := false
 		for _, path := range m.activeRepoFilter {
 			params.Add("repo", path)
 		}
 
-		// Branch filter: use server-side for real branch names.
-		// branchNone is a client-side sentinel for empty/NULL branches and can't be
-		// sent to the server, so it falls through to client-side filtering.
-		if m.activeBranchFilter != "" && m.activeBranchFilter != branchNone {
+		// Scope named and empty branches server-side.
+		if m.activeBranchFilter == branchNone {
+			params.Set("branch_empty", "true")
+		} else if m.activeBranchFilter != "" {
 			params.Set("branch", m.activeBranchFilter)
-		} else if m.activeBranchFilter == branchNone {
-			needsAllJobs = true
 		}
 
-		// Closed filter: use server-side to avoid fetching all jobs.
-		// Skip for client-side filtered views (needsAllJobs) so we get
-		// all jobs for accurate client-side metrics counting.
-		if m.hideClosed && !needsAllJobs {
+		if m.hideClosed {
 			params.Set("closed", "false")
 		}
 
@@ -243,15 +244,9 @@ func (m model) fetchJobs() tea.Cmd {
 			params.Set("hide_classify_jobs", "true")
 		}
 
-		// Set limit: use pagination unless we need client-side filtering (multi-repo)
-		if needsAllJobs {
-			params.Set("limit", "0")
-		} else {
-			limit := max(currentJobCount,
-				// Maintain paginated view on refresh
-				visibleRows)
-			params.Set("limit", fmt.Sprintf("%d", limit))
-		}
+		// Maintain the loaded page size on refresh.
+		limit := max(currentJobCount, visibleRows)
+		params.Set("limit", fmt.Sprintf("%d", limit))
 
 		result, err := m.loadJobsPage(params)
 		if err != nil {
@@ -270,22 +265,19 @@ func (m model) fetchJobs() tea.Cmd {
 func (m model) fetchMoreJobs() tea.Cmd {
 	seq := m.fetchSeq
 	return func() tea.Msg {
-		// Only fetch more when not doing client-side filtering that loads all jobs.
-		// Multi-repo display names paginate server-side via repeated repo params;
-		// the "(none)" branch sentinel still loads everything client-side.
-		if m.activeBranchFilter == branchNone {
-			return nil
-		}
 		offset := len(m.jobs)
 		params := neturl.Values{}
 		params.Set("limit", "50")
 		params.Set("offset", fmt.Sprintf("%d", offset))
+		params.Set("omit_stats", "true")
 		params.Set("omit_prompt", "true")
 		params.Set("include_findings", "true")
 		for _, path := range m.activeRepoFilter {
 			params.Add("repo", path)
 		}
-		if m.activeBranchFilter != "" && m.activeBranchFilter != branchNone {
+		if m.activeBranchFilter == branchNone {
+			params.Set("branch_empty", "true")
+		} else if m.activeBranchFilter != "" {
 			params.Set("branch", m.activeBranchFilter)
 		}
 		if m.hideClosed {
@@ -1075,6 +1067,7 @@ func (m model) fetchPanelMembers(runUUID uuid.UUID) tea.Cmd {
 		resp, err := api.ListJobsRaw(m.apiContext(), &daemonclient.ListJobsRequestOptions{Query: &daemonclient.ListJobsQuery{
 			PanelRun: new(runUUID), Limit: new(int64(0)),
 			OmitPrompt:      new(daemonclient.ListJobsQueryOmitPromptTrue),
+			OmitStats:       new(daemonclient.ListJobsQueryOmitStatsTrue),
 			IncludeFindings: new(daemonclient.ListJobsQueryIncludeFindingsTrue),
 		}})
 		if err != nil {
@@ -1505,6 +1498,7 @@ func (m model) fetchFixJobs() tea.Cmd {
 		params := neturl.Values{}
 		params.Set("job_type", "fix")
 		params.Set("limit", "200")
+		params.Set("omit_stats", "true")
 		params.Set("omit_prompt", "true")
 
 		result, err := m.loadJobsPage(params)

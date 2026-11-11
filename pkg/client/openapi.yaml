@@ -1537,6 +1537,8 @@ components:
           type: array
         git_ref:
           type: string
+        hold_synthesis:
+          type: boolean
         job_type:
           type: string
         min_severity:
@@ -1555,6 +1557,10 @@ components:
           type: string
         repo_path:
           type: string
+        review_prompt:
+          type: string
+        review_settings:
+          $ref: "#/components/schemas/SuppliedReviewSettings"
         review_type:
           type: string
         since:
@@ -2454,6 +2460,23 @@ components:
       required:
         - job_id
       type: object
+    JobInvocationsOutputBody:
+      additionalProperties: false
+      properties:
+        $schema:
+          description: A URL to the JSON Schema for this object.
+          examples:
+            - https://example.com/JobInvocationsOutputBody.json
+          format: uri
+          readOnly: true
+          type: string
+        invocations:
+          items:
+            $ref: "#/components/schemas/ReviewInvocation"
+          type: array
+      required:
+        - invocations
+      type: object
     JobStats:
       additionalProperties: false
       properties:
@@ -2475,10 +2498,16 @@ components:
         queued:
           format: int64
           type: integer
+        repo_count:
+          format: int64
+          type: integer
         running:
           format: int64
           type: integer
         skipped:
+          format: int64
+          type: integer
+        total:
           format: int64
           type: integer
       required:
@@ -3811,6 +3840,77 @@ components:
     ReviewIDSetValue:
       additionalProperties: false
       type: object
+    ReviewInvocation:
+      additionalProperties: false
+      properties:
+        agent:
+          type: string
+        enqueued_at:
+          format: date-time
+          type: string
+        error:
+          type: string
+        finished_at:
+          format: date-time
+          type:
+            - string
+            - "null"
+        git_ref:
+          type: string
+        id:
+          format: int64
+          type: integer
+        job_id:
+          format: int64
+          type: integer
+        model:
+          type: string
+        output:
+          type: string
+        provider:
+          type: string
+        raw_output:
+          type: string
+        reasoning:
+          type: string
+        retry_count:
+          format: int64
+          type: integer
+        session_id:
+          type: string
+        started_at:
+          format: date-time
+          type: string
+        status:
+          type: string
+        structured_output:
+          additionalProperties: true
+          type: object
+        usage:
+          anyOf:
+            - $ref: "#/components/schemas/Usage"
+            - type: "null"
+        usage_error:
+          type: string
+      required:
+        - id
+        - job_id
+        - enqueued_at
+        - started_at
+        - finished_at
+        - status
+        - agent
+        - model
+        - provider
+        - reasoning
+        - git_ref
+        - retry_count
+        - session_id
+        - raw_output
+        - output
+        - error
+        - usage
+      type: object
     ReviewJob:
       additionalProperties: false
       properties:
@@ -4110,6 +4210,21 @@ components:
         - created_at
         - closed
       type: object
+    ReviewToolPolicy:
+      additionalProperties: false
+      properties:
+        mcp:
+          additionalProperties:
+            items:
+              type: string
+            type: array
+          type: object
+        mode:
+          type: string
+      required:
+        - mode
+        - mcp
+      type: object
     ScanTokenUsageInputBody:
       additionalProperties: false
       properties:
@@ -4263,6 +4378,17 @@ components:
         - embedding_backlog
         - vector_state
       type: object
+    SearchHint:
+      additionalProperties: false
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+      required:
+        - code
+        - message
+      type: object
     SearchHit:
       additionalProperties: false
       properties:
@@ -4344,6 +4470,10 @@ components:
           type: boolean
         degraded_reason:
           type: string
+        hints:
+          items:
+            $ref: "#/components/schemas/SearchHint"
+          type: array
         hits:
           items:
             $ref: "#/components/schemas/SearchHit"
@@ -4418,6 +4548,10 @@ components:
           type: string
         last_turn_id:
           type: string
+        owned_commits:
+          additionalProperties:
+            type: boolean
+          type: object
         pending_reminders:
           additionalProperties:
             $ref: "#/components/schemas/PendingReminder"
@@ -4497,6 +4631,23 @@ components:
           type: string
       required:
         - status
+      type: object
+    StartPanelSynthesisInputBody:
+      additionalProperties: false
+      properties:
+        $schema:
+          description: A URL to the JSON Schema for this object.
+          examples:
+            - https://example.com/StartPanelSynthesisInputBody.json
+          format: uri
+          readOnly: true
+          type: string
+        panel_run_uuid:
+          description: The held panel to synthesize after its voting members finish
+          format: uuid
+          type: string
+      required:
+        - panel_run_uuid
       type: object
     StructuredReviewDocument:
       additionalProperties: false
@@ -4640,6 +4791,22 @@ components:
         - job_types
         - failures
         - cost
+      type: object
+    SuppliedReviewSettings:
+      additionalProperties: false
+      properties:
+        backup_agent:
+          type: string
+        backup_model:
+          type: string
+        binary_evidence:
+          type: boolean
+        exclude_patterns:
+          items:
+            type: string
+          type: array
+        tools:
+          $ref: "#/components/schemas/ReviewToolPolicy"
       type: object
     SyncPendingCounts:
       additionalProperties: false
@@ -4867,6 +5034,46 @@ components:
           type: string
       required:
         - lease_token
+      type: object
+    Usage:
+      additionalProperties: false
+      properties:
+        cache_creation_tokens:
+          format: int64
+          type: integer
+        cached_input_tokens:
+          format: int64
+          type: integer
+        cost_usd:
+          format: double
+          type: number
+        event_offset:
+          format: int64
+          type: integer
+        expected_provider_sessions:
+          format: int64
+          type: integer
+        has_cost:
+          type: boolean
+        input_tokens:
+          format: int64
+          type: integer
+        peak_context_tokens:
+          format: int64
+          type: integer
+        provider_session_ids:
+          items:
+            type: string
+          type: array
+        thread_id:
+          type: string
+        total_output_tokens:
+          format: int64
+          type: integer
+        usage_source:
+          type: string
+      required:
+        - cost_usd
       type: object
     VerdictStats:
       additionalProperties: false
@@ -5291,12 +5498,12 @@ paths:
           schema:
             description: Filter by branch name
             type: string
-        - description: Only jobs with empty/unset branch
+        - description: Only jobs with empty/unset branch or the "(none)" placeholder stored when no branch was found
           explode: false
           in: query
           name: branch_empty
           schema:
-            description: Only jobs with empty/unset branch
+            description: Only jobs with empty/unset branch or the "(none)" placeholder stored when no branch was found
             enum:
               - "true"
               - "false"
@@ -5799,6 +6006,36 @@ paths:
       summary: Create a background fix job
       tags:
         - jobs
+  /api/job/invocations:
+    get:
+      operationId: get-job-invocations
+      parameters:
+        - description: Local review job ID
+          explode: false
+          in: query
+          name: job_id
+          required: true
+          schema:
+            description: Local review job ID
+            format: int64
+            minimum: 1
+            type: integer
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobInvocationsOutputBody"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      summary: Get locally recorded agent invocations for a supplied review
+      tags:
+        - jobs
   /api/job/log:
     get:
       operationId: get-job-log
@@ -6036,12 +6273,12 @@ paths:
           schema:
             description: Filter by branch name
             type: string
-        - description: Only jobs with empty or unset branch
+        - description: Only jobs with empty/unset branch or the "(none)" placeholder stored when no branch was found
           explode: false
           in: query
           name: branch_empty
           schema:
-            description: Only jobs with empty or unset branch
+            description: Only jobs with empty/unset branch or the "(none)" placeholder stored when no branch was found
             enum:
               - "true"
               - "false"
@@ -6108,6 +6345,28 @@ paths:
           name: include_panel_members
           schema:
             description: Include individual panel member jobs alongside panel synthesis jobs
+            enum:
+              - "true"
+              - "false"
+              - ""
+            type: string
+        - description: Include total jobs and distinct repository counts in stats
+          explode: false
+          in: query
+          name: include_totals
+          schema:
+            description: Include total jobs and distinct repository counts in stats
+            enum:
+              - "true"
+              - "false"
+              - ""
+            type: string
+        - description: Skip the queue counts (stats and filtered_stats) for callers that only read jobs
+          explode: false
+          in: query
+          name: omit_stats
+          schema:
+            description: Skip the queue counts (stats and filtered_stats) for callers that only read jobs
             enum:
               - "true"
               - "false"
@@ -6371,6 +6630,31 @@ paths:
       summary: Backfill legacy review verdicts
       tags:
         - maintenance
+  /api/panel/synthesize:
+    post:
+      operationId: start-panel-synthesis
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StartPanelSynthesisInputBody"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReviewJob"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      summary: Start a held panel's synthesis after its voting members finish
+      tags:
+        - jobs
   /api/ping:
     get:
       operationId: ping

@@ -7,7 +7,9 @@ import type { ListJobsClosed } from "./listJobsClosed";
 import type { ListJobsHideClassifyJobs } from "./listJobsHideClassifyJobs";
 import type { ListJobsIncludeFindings } from "./listJobsIncludeFindings";
 import type { ListJobsIncludePanelMembers } from "./listJobsIncludePanelMembers";
+import type { ListJobsIncludeTotals } from "./listJobsIncludeTotals";
 import type { ListJobsOmitPrompt } from "./listJobsOmitPrompt";
+import type { ListJobsOmitStats } from "./listJobsOmitStats";
 
 export type ListJobsParams = {
   /**
@@ -39,7 +41,7 @@ export type ListJobsParams = {
    */
   branch?: string;
   /**
-   * Only jobs with empty or unset branch
+   * Only jobs with empty/unset branch or the "(none)" placeholder stored when no branch was found
    */
   branch_empty?: ListJobsBranchEmpty;
   /**
@@ -70,6 +72,14 @@ export type ListJobsParams = {
    * Include individual panel member jobs alongside panel synthesis jobs
    */
   include_panel_members?: ListJobsIncludePanelMembers;
+  /**
+   * Include total jobs and distinct repository counts in stats
+   */
+  include_totals?: ListJobsIncludeTotals;
+  /**
+   * Skip the queue counts (stats and filtered_stats) for callers that only read jobs
+   */
+  omit_stats?: ListJobsOmitStats;
   /**
    * Omit prompt and diff content from returned jobs (metadata-only listing; queued/running jobs keep their prompt)
    */

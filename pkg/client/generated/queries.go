@@ -36,7 +36,7 @@ type GetCostQuery struct {
 	// Branch Filter by branch name
 	Branch *string `json:"branch,omitempty"`
 
-	// BranchEmpty Only jobs with empty/unset branch
+	// BranchEmpty Only jobs with empty/unset branch or the "(none)" placeholder stored when no branch was found
 	BranchEmpty *GetCostQueryBranchEmpty `json:"branch_empty,omitempty"`
 
 	// Since Time window (e.g. 7d); default all-time
@@ -138,6 +138,15 @@ type ExportReviewsQuery struct {
 	Cursor *string `json:"cursor,omitempty"`
 }
 
+type GetJobInvocationsQuery struct {
+	// JobID Local review job ID
+	JobID int64 `json:"job_id" validate:"gte=1"`
+}
+
+func (g GetJobInvocationsQuery) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(g))
+}
+
 type GetJobLogQuery struct {
 	// Raw Return the complete raw log, including orphaned logs
 	Raw *bool `json:"raw,omitempty"`
@@ -187,7 +196,7 @@ type ListJobsQuery struct {
 	// Branch Filter by branch name
 	Branch *string `json:"branch,omitempty"`
 
-	// BranchEmpty Only jobs with empty or unset branch
+	// BranchEmpty Only jobs with empty/unset branch or the "(none)" placeholder stored when no branch was found
 	BranchEmpty *ListJobsQueryBranchEmpty `json:"branch_empty,omitempty"`
 
 	// BranchIncludeEmpty Include jobs with no branch when filtering by branch
@@ -210,6 +219,12 @@ type ListJobsQuery struct {
 
 	// IncludePanelMembers Include individual panel member jobs alongside panel synthesis jobs
 	IncludePanelMembers *ListJobsQueryIncludePanelMembers `json:"include_panel_members,omitempty"`
+
+	// IncludeTotals Include total jobs and distinct repository counts in stats
+	IncludeTotals *ListJobsQueryIncludeTotals `json:"include_totals,omitempty"`
+
+	// OmitStats Skip the queue counts (stats and filtered_stats) for callers that only read jobs
+	OmitStats *ListJobsQueryOmitStats `json:"omit_stats,omitempty"`
 
 	// OmitPrompt Omit prompt and diff content from returned jobs (metadata-only listing; queued/running jobs keep their prompt)
 	OmitPrompt *ListJobsQueryOmitPrompt `json:"omit_prompt,omitempty"`
@@ -280,6 +295,20 @@ func (l ListJobsQuery) Validate() error {
 		if v, ok := any(l.IncludePanelMembers).(runtime.Validator); ok {
 			if err := v.Validate(); err != nil {
 				errors = errors.Append("IncludePanelMembers", err)
+			}
+		}
+	}
+	if l.IncludeTotals != nil {
+		if v, ok := any(l.IncludeTotals).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("IncludeTotals", err)
+			}
+		}
+	}
+	if l.OmitStats != nil {
+		if v, ok := any(l.OmitStats).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("OmitStats", err)
 			}
 		}
 	}

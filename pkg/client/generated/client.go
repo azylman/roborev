@@ -111,6 +111,10 @@ type ClientInterface interface {
 	CreateFixJob(ctx context.Context, options *CreateFixJobRequestOptions, reqEditors ...runtime.RequestEditorFn) (*CreateFixJobResponse, error)
 	CreateFixJobWithResponse(ctx context.Context, options *CreateFixJobRequestOptions, reqEditors ...runtime.RequestEditorFn) (*CreateFixJobResp, error)
 
+	// GetJobInvocations Get locally recorded agent invocations for a supplied review
+	GetJobInvocations(ctx context.Context, options *GetJobInvocationsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetJobInvocationsResponse, error)
+	GetJobInvocationsWithResponse(ctx context.Context, options *GetJobInvocationsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetJobInvocationsResp, error)
+
 	// GetJobLog Get raw job log bytes
 	GetJobLog(ctx context.Context, options *GetJobLogRequestOptions, reqEditors ...runtime.RequestEditorFn) (*struct{}, error)
 	GetJobLogWithResponse(ctx context.Context, options *GetJobLogRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetJobLogResp, error)
@@ -166,6 +170,10 @@ type ClientInterface interface {
 	// BackfillVerdicts Backfill legacy review verdicts
 	BackfillVerdicts(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*BackfillVerdictsResponse, error)
 	BackfillVerdictsWithResponse(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*BackfillVerdictsResp, error)
+
+	// StartPanelSynthesis Start a held panel's synthesis after its voting members finish
+	StartPanelSynthesis(ctx context.Context, options *StartPanelSynthesisRequestOptions, reqEditors ...runtime.RequestEditorFn) (*StartPanelSynthesisResponse, error)
+	StartPanelSynthesisWithResponse(ctx context.Context, options *StartPanelSynthesisRequestOptions, reqEditors ...runtime.RequestEditorFn) (*StartPanelSynthesisResp, error)
 
 	// Ping Get daemon liveness identity
 	Ping(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*PingResponse, error)
@@ -1634,6 +1642,74 @@ func (c *Client) CreateFixJob(ctx context.Context, options *CreateFixJobRequestO
 	return responseParser(ctx, resp)
 }
 
+// GetJobInvocations Get locally recorded agent invocations for a supplied review
+func (c *Client) GetJobInvocations(ctx context.Context, options *GetJobInvocationsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetJobInvocationsResponse, error) {
+	var err error
+
+	queryEncoding := map[string]runtime.QueryEncoding{
+		"job_id": {Style: "form", Explode: &[]bool{false}[0]},
+	}
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL:    c.apiClient.GetBaseURL() + "/api/job/invocations",
+		Method:        "GET",
+		Options:       options,
+		QueryEncoding: queryEncoding,
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*GetJobInvocationsResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(GetJobInvocationsErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "GetJobInvocationsErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(GetJobInvocationsResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "GetJobInvocationsResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/job/invocations")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
 // GetJobLog Get raw job log bytes
 func (c *Client) GetJobLog(ctx context.Context, options *GetJobLogRequestOptions, reqEditors ...runtime.RequestEditorFn) (*struct{}, error) {
 	var err error
@@ -2053,10 +2129,12 @@ func (c *Client) ListJobs(ctx context.Context, options *ListJobsRequestOptions, 
 		"id":                    {Style: "form", Explode: &[]bool{false}[0]},
 		"include_findings":      {Style: "form", Explode: &[]bool{false}[0]},
 		"include_panel_members": {Style: "form", Explode: &[]bool{false}[0]},
+		"include_totals":        {Style: "form", Explode: &[]bool{false}[0]},
 		"job_type":              {Style: "form", Explode: &[]bool{false}[0]},
 		"limit":                 {Style: "form", Explode: &[]bool{false}[0]},
 		"offset":                {Style: "form", Explode: &[]bool{false}[0]},
 		"omit_prompt":           {Style: "form", Explode: &[]bool{false}[0]},
+		"omit_stats":            {Style: "form", Explode: &[]bool{false}[0]},
 		"panel_run":             {Style: "form", Explode: &[]bool{false}[0]},
 		"repo_prefix":           {Style: "form", Explode: &[]bool{false}[0]},
 		"sort":                  {Style: "form", Explode: &[]bool{false}[0]},
@@ -2548,6 +2626,70 @@ func (c *Client) BackfillVerdicts(ctx context.Context, reqEditors ...runtime.Req
 	}
 
 	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/maintenance/verdicts/backfill")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// StartPanelSynthesis Start a held panel's synthesis after its voting members finish
+func (c *Client) StartPanelSynthesis(ctx context.Context, options *StartPanelSynthesisRequestOptions, reqEditors ...runtime.RequestEditorFn) (*StartPanelSynthesisResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/panel/synthesize",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*StartPanelSynthesisResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(StartPanelSynthesisErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "StartPanelSynthesisErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(StartPanelSynthesisResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "StartPanelSynthesisResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/panel/synthesize")
 	if err != nil {
 		return nil, fmt.Errorf("error executing request: %w", err)
 	}

@@ -104,6 +104,11 @@ func openOnce(ctx context.Context, path string) (_ *Index, err error) {
 		}
 	} else if err := validateSchema(ctx, db); err != nil {
 		return nil, err
+	} else if err := upgradeSidecar(ctx, db); err != nil {
+		return nil, err
+	}
+	if _, err := db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS review_mirror_group_key ON review_mirror(group_key)`); err != nil {
+		return nil, fmt.Errorf("create search sidecar group index: %w", err)
 	}
 	vectors, err := sqlitevec.New[string, string](ctx, db, sqlitevec.Schema{
 		DocsTable:      "review_mirror",

@@ -63,7 +63,7 @@ func (w WebSessionStatusAuthentication) Validate() error {
 	}
 }
 
-// GetCostQueryBranchEmpty Only jobs with empty/unset branch
+// GetCostQueryBranchEmpty Only jobs with empty/unset branch or the "(none)" placeholder stored when no branch was found
 type GetCostQueryBranchEmpty string
 
 const (
@@ -81,7 +81,7 @@ func (g GetCostQueryBranchEmpty) Validate() error {
 	}
 }
 
-// ListJobsQueryBranchEmpty Only jobs with empty or unset branch
+// ListJobsQueryBranchEmpty Only jobs with empty/unset branch or the "(none)" placeholder stored when no branch was found
 type ListJobsQueryBranchEmpty string
 
 const (
@@ -173,6 +173,44 @@ func (l ListJobsQueryIncludePanelMembers) Validate() error {
 		return nil
 	default:
 		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid ListJobsQueryIncludePanelMembers value, got: %v", l))
+	}
+}
+
+// ListJobsQueryIncludeTotals Include total jobs and distinct repository counts in stats
+type ListJobsQueryIncludeTotals string
+
+const (
+	ListJobsQueryIncludeTotalsEmpty ListJobsQueryIncludeTotals = ""
+	ListJobsQueryIncludeTotalsFalse ListJobsQueryIncludeTotals = "false"
+	ListJobsQueryIncludeTotalsTrue  ListJobsQueryIncludeTotals = "true"
+)
+
+// Validate checks if the ListJobsQueryIncludeTotals value is valid
+func (l ListJobsQueryIncludeTotals) Validate() error {
+	switch l {
+	case ListJobsQueryIncludeTotalsEmpty, ListJobsQueryIncludeTotalsFalse, ListJobsQueryIncludeTotalsTrue:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid ListJobsQueryIncludeTotals value, got: %v", l))
+	}
+}
+
+// ListJobsQueryOmitStats Skip the queue counts (stats and filtered_stats) for callers that only read jobs
+type ListJobsQueryOmitStats string
+
+const (
+	ListJobsQueryOmitStatsEmpty ListJobsQueryOmitStats = ""
+	ListJobsQueryOmitStatsFalse ListJobsQueryOmitStats = "false"
+	ListJobsQueryOmitStatsTrue  ListJobsQueryOmitStats = "true"
+)
+
+// Validate checks if the ListJobsQueryOmitStats value is valid
+func (l ListJobsQueryOmitStats) Validate() error {
+	switch l {
+	case ListJobsQueryOmitStatsEmpty, ListJobsQueryOmitStatsFalse, ListJobsQueryOmitStatsTrue:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid ListJobsQueryOmitStats value, got: %v", l))
 	}
 }
 

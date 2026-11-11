@@ -21,7 +21,7 @@ import (
 // single probe invocation is approximately timeout + WaitDelay: CommandContext
 // kills the process at the deadline, and WaitDelay bounds how long Wait may
 // block on unclosed stdout/stderr pipes held by orphan descendants.
-var identityProbeTimeout = 2 * time.Second
+var identityProbeTimeout = 5 * time.Second
 
 // identityProbeWaitDelay is the post-kill Wait bound for identity probes.
 // WaitDelay == 0 (the CombinedOutput default) can leave Wait blocked forever
@@ -185,6 +185,10 @@ func versionOutputLooksLikeGrok(command string) bool {
 }
 
 func probeVersionIdentity(command string) commandIdentity {
+	return probeVersionIdentityWithRunner(command, runIdentityProbe)
+}
+
+func probeVersionIdentityWithRunner(command string, runProbe func(context.Context, string, string) ([]byte, error)) commandIdentity {
 	ctx, cancel := context.WithTimeout(context.Background(), identityProbeTimeout)
 	defer cancel()
 	// Availability checks run before an agent is selected and have no review
@@ -199,7 +203,7 @@ func probeVersionIdentity(command string) commandIdentity {
 		if ctx.Err() != nil {
 			return identityUnknown
 		}
-		out, err := runIdentityProbe(ctx, command, arg)
+		out, err := runProbe(ctx, command, arg)
 		// Timeout, WaitDelay, oversize dump, crash, or empty → try next flag
 		// or fail closed as unknown. Never treat these as NotGrok.
 		if errors.Is(err, errProbeOutputExceeded) ||

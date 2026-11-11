@@ -194,6 +194,10 @@ type CreateFixJobErrorResponseJSON500 = ErrorResponse
 
 type CreateFixJobErrorResponseJSON503 = ErrorResponse
 
+type GetJobInvocationsResponse = JobInvocationsOutputBody
+
+type GetJobInvocationsErrorResponse = ErrorModel
+
 type GetJobLogErrorResponse = ErrorModel
 
 type GetJobOutputErrorResponse = ErrorModel
@@ -241,6 +245,10 @@ type ScanTokenUsageErrorResponse = ErrorModel
 type BackfillVerdictsResponse = BackfillVerdictsOutputBody
 
 type BackfillVerdictsErrorResponse = ErrorModel
+
+type StartPanelSynthesisResponse = ReviewJob
+
+type StartPanelSynthesisErrorResponse = ErrorModel
 
 type PingResponse = PingInfo
 
@@ -613,6 +621,14 @@ type CreateFixJobResp struct {
 	JSON503      *CreateFixJobErrorResponseJSON503
 }
 
+type GetJobInvocationsResp struct {
+	HTTPResponse                      *http.Response
+	Body                              []byte
+	StatusCode                        int
+	JSON200                           *GetJobInvocationsResponse
+	ApplicationProblemPlusJSONDefault *GetJobInvocationsErrorResponse
+}
+
 type GetJobLogResp struct {
 	HTTPResponse                      *http.Response
 	Body                              []byte
@@ -719,6 +735,14 @@ type BackfillVerdictsResp struct {
 	StatusCode                        int
 	JSON200                           *BackfillVerdictsResponse
 	ApplicationProblemPlusJSONDefault *BackfillVerdictsErrorResponse
+}
+
+type StartPanelSynthesisResp struct {
+	HTTPResponse                      *http.Response
+	Body                              []byte
+	StatusCode                        int
+	JSON200                           *StartPanelSynthesisResponse
+	ApplicationProblemPlusJSONDefault *StartPanelSynthesisErrorResponse
 }
 
 type PingResp struct {
@@ -1344,6 +1368,21 @@ func (c *RawClient) CreateFixJobRaw(ctx context.Context, options *CreateFixJobRe
 	return c.doer.Do(ctx, req)
 }
 
+func (c *RawClient) GetJobInvocationsRaw(ctx context.Context, options *GetJobInvocationsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+	if options == nil {
+		options = &GetJobInvocationsRequestOptions{}
+	}
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/job/invocations",
+		Method:     "GET",
+		Options:    options,
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
 func (c *RawClient) GetJobLogRaw(ctx context.Context, options *GetJobLogRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
 	if options == nil {
 		options = &GetJobLogRequestOptions{}
@@ -1553,6 +1592,22 @@ func (c *RawClient) BackfillVerdictsRaw(ctx context.Context, reqEditors ...runti
 	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
 		RequestURL: c.apiClient.GetBaseURL() + "/api/maintenance/verdicts/backfill",
 		Method:     "POST",
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) StartPanelSynthesisRaw(ctx context.Context, options *StartPanelSynthesisRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+	if options == nil {
+		options = &StartPanelSynthesisRequestOptions{}
+	}
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/panel/synthesize",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
 	}, reqEditors...)
 	if err != nil {
 		return nil, fmt.Errorf("error creating request: %w", err)

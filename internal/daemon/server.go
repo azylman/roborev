@@ -58,6 +58,12 @@ type Server struct {
 	search                  reviewSearcher
 	searchReconciler        searchReconciler
 	searchNow               func() time.Time
+	autoDesignScanMu        sync.Mutex
+	autoDesignScanAt        time.Time
+	autoDesignScanEnabled   bool
+	autoDesignScanRunning   bool
+	autoDesignScanStopped   bool
+	autoDesignScanDBWG      sync.WaitGroup
 	searchMu                sync.Mutex
 	searchCancel            context.CancelFunc
 	searchSubscriberID      int
@@ -117,10 +123,6 @@ type Server struct {
 	goalWatchDone           chan struct{}
 	postCommitScheduler     *postCommitScheduler
 	goalGate                *goalGate
-
-	// Cached machine ID to avoid INSERT on every status request
-	machineIDMu sync.Mutex
-	machineID   uuid.UUID
 }
 
 const dailyTelemetryInterval = 24 * time.Hour
@@ -414,6 +416,7 @@ func (s *Server) Start(ctx context.Context) error {
 	// Start worker pool before advertising availability.
 	s.workerPool.Start()
 	s.startSearch(ctx)
+	s.startAutoDesignRepoScan()
 
 	ready, serveExited, err := waitForServerReady(ctx, ep, 2*time.Second, serveErrCh, s.startupAuth())
 	if err != nil {
@@ -733,6 +736,8 @@ func (s *Server) Stop() error {
 }
 
 func (s *Server) stopOnce0() error {
+	s.stopAutoDesignRepoScan()
+
 	// Log daemon stop before shutting down components
 	if s.activityLog != nil {
 		uptime := time.Since(s.startTime)
@@ -1080,7 +1085,7 @@ func (s *Server) SetSyncWorker(sw *storage.SyncWorker) {
 
 func (s *Server) afterSyncPullWrite() {
 	if s.searchReconciler != nil {
-		s.searchReconciler.Wake()
+		s.searchReconciler.WakeChanges()
 	}
 }
 
@@ -1121,6 +1126,9 @@ func resolveRerunOpts(
 	assignment *storage.ExperimentAssignmentInput,
 	selectedAgent string,
 ) (storage.ReenqueueOpts, error) {
+	if hasSuppliedReviewSettings(job) {
+		return suppliedReviewRerunOpts(job, cfg, selectedAgent)
+	}
 	// Budget routing changes the effective execution choice for one retry
 	// chain. Resolve a manual rerun's model and availability from its original
 	// choice, unless the caller selects a different agent.
@@ -1390,23 +1398,13 @@ func reusableSessionTarget(gitRef string) string {
 	return strings.TrimSpace(gitRef)
 }
 
-// getMachineID returns the cached machine ID, fetching it on first successful call.
-// Retries on each call until successful to handle transient DB errors.
+// getMachineID returns the machine ID, or nil when it is unavailable.
 func (s *Server) getMachineID() *uuid.UUID {
-	s.machineIDMu.Lock()
-	defer s.machineIDMu.Unlock()
-
-	if s.machineID != uuid.Nil() {
-		return &s.machineID
-	}
-
-	if id, err := s.db.GetMachineID(); err == nil && id != uuid.Nil() {
-		s.machineID = id
-	}
-	if s.machineID == uuid.Nil() {
+	id, err := s.db.GetMachineID()
+	if err != nil || id == uuid.Nil() {
 		return nil
 	}
-	return &s.machineID
+	return &id
 }
 
 func jobLogSafeEnd(f *os.File, fileSize int64, jsonl bool) int64 {
@@ -1877,6 +1875,9 @@ func (s *Server) humaListJobs(
 	// FilteredStats below carries the exact closed-filtered counts for browser
 	// views that need counts matching the visible rows.
 	statsOpts := remoteJobOptions(ctx)
+	if input.IncludeTotals == "true" {
+		statsOpts = append(statsOpts, storage.WithJobTotals())
+	}
 	// Panel expansion must not scan the entire queue for aggregate counts.
 	if input.PanelRun != uuid.Nil() {
 		statsOpts = append(statsOpts, storage.WithPanelRun(input.PanelRun))
@@ -1936,28 +1937,31 @@ func (s *Server) humaListJobs(
 		statsOpts,
 		storage.WithExcludePanelRole(storage.PanelRoleMember),
 	)
-	stats, statsErr := s.db.CountJobStats(input.Status, repo, statsOpts...)
-	if statsErr != nil {
-		log.Printf(
-			"Warning: failed to count job stats: %v", statsErr,
-		)
-	}
-	var filteredStats *storage.JobStats
-	if input.Closed == "true" || input.Closed == "false" {
-		filteredOpts := append(
-			append([]storage.ListJobsOption(nil), statsOpts...),
-			storage.WithClosed(input.Closed == "true"),
-		)
-		filtered, filteredErr := s.db.CountJobStats(
-			input.Status, repo, filteredOpts...,
-		)
-		if filteredErr != nil {
+	var stats, filteredStats *storage.JobStats
+	if input.OmitStats != "true" {
+		counted, statsErr := s.db.CountJobStats(input.Status, repo, statsOpts...)
+		if statsErr != nil {
 			log.Printf(
-				"Warning: failed to count closed-filtered job stats: %v",
-				filteredErr,
+				"Warning: failed to count job stats: %v", statsErr,
 			)
-		} else {
-			filteredStats = &filtered
+		}
+		stats = &counted
+		if input.Closed == "true" || input.Closed == "false" {
+			filteredOpts := append(
+				append([]storage.ListJobsOption(nil), statsOpts...),
+				storage.WithClosed(input.Closed == "true"),
+			)
+			filtered, filteredErr := s.db.CountJobStats(
+				input.Status, repo, filteredOpts...,
+			)
+			if filteredErr != nil {
+				log.Printf(
+					"Warning: failed to count closed-filtered job stats: %v",
+					filteredErr,
+				)
+			} else {
+				filteredStats = &filtered
+			}
 		}
 	}
 
@@ -1968,7 +1972,7 @@ func (s *Server) humaListJobs(
 	resp.Body.Jobs = jobs
 	resp.Body.HasMore = hasMore
 	resp.Body.NextCursor = nextCursor
-	resp.Body.Stats = &stats
+	resp.Body.Stats = stats
 	resp.Body.FilteredStats = filteredStats
 	return resp, nil
 }
@@ -3002,6 +3006,19 @@ func (s *Server) humaEnqueue(
 	ctx context.Context, input *EnqueueInput,
 ) (*RawJSONOutput, error) {
 	req := input.Body
+	if req.HoldSynthesis && (req.Panel == "" || req.Panel == "none" || req.Source != "" ||
+		req.CustomPrompt != "" || req.ReviewPrompt != "" || req.ReviewType == config.ReviewTypeGoal) {
+		return rawJSONOutput(http.StatusBadRequest, ErrorResponse{Error: "hold_synthesis requires an explicitly named foreground review panel"})
+	}
+	if err := validateSuppliedReviewSettings(&req); err != nil {
+		return rawJSONOutput(http.StatusBadRequest, ErrorResponse{Error: err.Error()})
+	}
+	if req.ReviewPrompt != "" {
+		if err := validateReviewPromptRequest(req); err != nil {
+			return rawJSONOutput(http.StatusBadRequest, ErrorResponse{Error: err.Error()})
+		}
+		req.Source = storage.JobSourceReviewPrompt
+	}
 	if req.ReviewType == config.ReviewTypeGoal {
 		return s.enqueueGoalReview(ctx, req)
 	}
@@ -3046,7 +3063,10 @@ func (s *Server) humaEnqueue(
 		worktreePath = filepath.Clean(checkoutRoot)
 	}
 	cfg := s.configWatcher.Config().ForRepo(checkoutRoot)
-	repoCfg, err := config.LoadRepoConfig(checkoutRoot)
+	var repoCfg *config.RepoConfig
+	if req.ReviewSettings == nil {
+		repoCfg, err = config.LoadRepoConfig(checkoutRoot)
+	}
 	if err != nil {
 		return rawJSONOutput(
 			http.StatusBadRequest,
@@ -3081,7 +3101,7 @@ func (s *Server) humaEnqueue(
 			branchToCheck = ""
 		}
 	}
-	if branchToCheck != "" &&
+	if req.ReviewSettings == nil && branchToCheck != "" &&
 		isBranchExcluded(checkoutRoot, repoCfg, branchToCheck, req.Source) {
 		return rawJSONOutput(http.StatusOK, EnqueueSkippedResponse{
 			Skipped: true,
@@ -3131,7 +3151,10 @@ func (s *Server) humaEnqueue(
 	requestedModel := strings.TrimSpace(req.Model)
 	requestedProvider := strings.TrimSpace(req.Provider)
 
-	repoCfg, rawRepoCfg, err := config.LoadRepoConfigWithRaw(resolutionPath)
+	var rawRepoCfg map[string]any
+	if req.ReviewSettings == nil {
+		repoCfg, rawRepoCfg, err = config.LoadRepoConfigWithRaw(resolutionPath)
+	}
 	if err != nil {
 		return rawJSONOutput(
 			http.StatusBadRequest,
@@ -3169,7 +3192,7 @@ func (s *Server) humaEnqueue(
 		if inferred := git.InferBranchForCommit(
 			ctx, checkoutRoot, descriptor.sessionSHA,
 		); inferred != "" {
-			if isBranchExcluded(
+			if req.ReviewSettings == nil && isBranchExcluded(
 				checkoutRoot, repoCfg, inferred, req.Source,
 			) {
 				return rawJSONOutput(http.StatusOK, EnqueueSkippedResponse{
@@ -3234,6 +3257,11 @@ func (s *Server) humaEnqueue(
 
 	merged := config.MergeReviewConfigFromConfig(repoCfg, cfg)
 	panelName := selectPanelForTarget(descriptor, req, merged)
+	// Stored-prompt targets, such as insights jobs, build their prompt after
+	// the upfront check and never run as panels, so the hold would be ignored.
+	if req.HoldSynthesis && panelName == "" {
+		return rawJSONOutput(http.StatusBadRequest, ErrorResponse{Error: "hold_synthesis requires an explicitly named foreground review panel"})
+	}
 	if panelName != "" {
 		return s.enqueuePanelRun(ctx, panelRunInputs{
 			descriptor:     descriptor,
@@ -3315,6 +3343,14 @@ type resolvedSingleAgent struct {
 func (s *Server) resolveSingleAgent(
 	in singleAgentInputs,
 ) (resolvedSingleAgent, *RawJSONOutput) {
+	if in.req.ReviewSettings != nil {
+		execution, err := resolveSuppliedReviewExecution(in)
+		if err != nil {
+			out, _ := rawJSONOutput(http.StatusBadRequest, ErrorResponse{Error: err.Error()})
+			return resolvedSingleAgent{}, out
+		}
+		return execution, nil
+	}
 	resolution, err := agent.ResolveWorkflowConfigFromConfig(
 		in.req.Agent, in.repoCfg, in.cfg, in.workflow, in.reasoning,
 	)
@@ -3403,6 +3439,19 @@ func (s *Server) enqueueSingleAgent(
 	o.Provider = in.descriptor.requestedProvider
 	o.Reasoning = in.reasoning
 	o.ReviewType = in.req.ReviewType
+	if in.req.ReviewSettings != nil {
+		o.BackupAgent, o.BackupModel = execution.BackupAgent, execution.BackupModel
+		// Even an empty severity is supplied policy, not an invitation to resolve local defaults.
+		plan, err := experimentPlanForJob(o)
+		if err != nil {
+			return rawJSONOutput(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
+		}
+		snapshot, err := json.Marshal(suppliedReviewSnapshot{SuppliedReviewSettings: *in.req.ReviewSettings, Execution: plan})
+		if err != nil {
+			return rawJSONOutput(http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
+		}
+		o.PanelMemberConfigJSON = string(snapshot)
+	}
 	if in.experiment != nil {
 		o.BackupAgent = execution.BackupAgent
 		o.BackupModel = execution.BackupModel
@@ -3419,10 +3468,12 @@ func (s *Server) enqueueSingleAgent(
 		}
 		o.Experiment = assignment
 	}
-	o.SessionID, o.ResumeSourceJobUUID = findCompatibleReusableSession(
-		ctx, s.db, in.checkoutRoot, in.descriptor.sessionSHA, o,
-		in.repoCfg, in.rawRepoCfg, in.cfg, o.Experiment, 0,
-	)
+	if in.req.ReviewSettings == nil {
+		o.SessionID, o.ResumeSourceJobUUID = findCompatibleReusableSession(
+			ctx, s.db, in.checkoutRoot, in.descriptor.sessionSHA, o,
+			in.repoCfg, in.rawRepoCfg, in.cfg, o.Experiment, 0,
+		)
+	}
 
 	var job *storage.ReviewJob
 	var duplicate bool
@@ -3467,7 +3518,7 @@ func (s *Server) finishSingleEnqueue(
 	ctx context.Context, job *storage.ReviewJob,
 	agentName string, in singleAgentInputs,
 ) {
-	if job.JobType == storage.JobTypeReview &&
+	if in.req.ReviewPrompt == "" && job.JobType == storage.JobTypeReview &&
 		config.IsGeneralReviewType(in.req.ReviewType) {
 		if err := s.maybeDispatchAutoDesign(ctx, job); err != nil {
 			log.Printf("auto-design dispatch failed: %v", err)
