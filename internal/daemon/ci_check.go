@@ -20,6 +20,7 @@ import (
 
 	"go.kenn.io/roborev/internal/agent"
 	gitpkg "go.kenn.io/roborev/internal/git"
+	"go.kenn.io/roborev/internal/proctrack"
 	reviewpkg "go.kenn.io/roborev/internal/review"
 	"go.kenn.io/roborev/internal/sandbox"
 	"go.kenn.io/roborev/internal/storage"
@@ -75,6 +76,8 @@ func (wp *WorkerPool) checkSynthesis(ctx context.Context, job *storage.ReviewJob
 		if wp.ciGitEnv != nil {
 			if panel, err := wp.db.GetCIPanelBySynthesisJobID(job.ID); err == nil && panel != nil {
 				env = wp.ciGitEnv(panel.GithubRepo)
+			} else if review, err := wp.db.GetCIBranchReviewBySynthesisJobID(ctx, job.ID); err == nil {
+				env = wp.ciGitEnv(review.GithubRepo)
 			}
 		}
 		checker := wp.ciCheck
@@ -82,7 +85,19 @@ func (wp *WorkerPool) checkSynthesis(ctx context.Context, job *storage.ReviewJob
 			checker = wp.runCICheck
 		}
 		capture := tokens.NewCodexUsageCaptureWriter()
-		checked, checkErr := checker(ctx, job, *check, doc, env, io.MultiWriter(outputWriter, capture))
+		// The checker runs in its own phase: a memory breach there stops and
+		// cancels only the checker, so the finished review is still completed.
+		checkCtx, checkScope := proctrack.OpenScope(ctx)
+		checked, checkErr := checker(checkCtx, job, *check, doc, env, io.MultiWriter(outputWriter, capture))
+		// Close first: a sample taken while the checker's processes were
+		// exiting can still record a breach. A breach discards the checker's
+		// verdicts even if it returned them, so the review keeps one outcome.
+		if err := checkScope.Close(); err != nil {
+			log.Printf("CI checker for job %d: %v", job.ID, err)
+		}
+		if b := checkScope.Breach(); b != nil {
+			checkErr = b
+		}
 		capture.Flush()
 		res.checkerUsage = capture.Usage()
 		if res.checkerUsage != nil {
@@ -93,14 +108,19 @@ func (wp *WorkerPool) checkSynthesis(ctx context.Context, job *storage.ReviewJob
 		}
 		if checkErr != nil {
 			fmt.Fprintf(outputWriter, "CI checker failed; keeping original review: %v\n", checkErr)
-		} else if !reflect.DeepEqual(checked.Findings, doc.Findings) {
-			if len(checked.Findings) < len(doc.Findings) {
-				checked.Verdict = map[bool]string{true: structuredreview.VerdictPass, false: structuredreview.VerdictFail}[reviewpkg.SynthesisVerdict(checked, job.MinSeverity).Passed()]
+			checked = doc
+			checked.Check = &structuredreview.Check{Status: structuredreview.CheckFailed}
+		} else if len(checked.Findings) < len(doc.Findings) {
+			checked.Verdict = map[bool]string{true: structuredreview.VerdictPass, false: structuredreview.VerdictFail}[reviewpkg.SynthesisVerdict(checked, job.MinSeverity).Passed()]
+		}
+		if reflect.DeepEqual(checked.Findings, doc.Findings) {
+			// Only the check record changed, so keep the review's rendering and verdict.
+			if raw, err := json.Marshal(checked); err == nil {
+				res.review.StructuredOutput = raw
 			}
-			if result, err := synthesisDocumentResult(job, checked); err == nil {
-				result.Agent = res.review.Agent
-				res.review = result
-			}
+		} else if result, err := synthesisDocumentResult(job, checked); err == nil {
+			result.Agent = res.review.Agent
+			res.review = result
 		}
 		return res, true
 	}
@@ -147,6 +167,9 @@ func (wp *WorkerPool) runCICheck(ctx context.Context, job *storage.ReviewJob, cf
 		return doc, err
 	}
 	if cfg.Rewrite {
+		// The rewrite is a phase of its own: a breach there keeps the checked
+		// review instead of discarding the check.
+		rewriteCtx, rewriteScope := proctrack.OpenScope(ctx)
 		var repo string
 		var rewriteAgent *agent.CodexAgent
 		phase := 0
@@ -170,8 +193,14 @@ func (wp *WorkerPool) runCICheck(ctx context.Context, job *storage.ReviewJob, cf
 			}
 			phase++
 			fmt.Fprintf(out, "CI rewrite phase %d\n", phase)
-			return rewriteAgent.ReviewWithSchema(ctx, repo, job.GitRef, text, schema, out)
+			return rewriteAgent.ReviewWithSchema(rewriteCtx, repo, job.GitRef, text, schema, out)
 		})
+		if closeErr := rewriteScope.Close(); closeErr != nil {
+			log.Printf("CI rewrite for job %d: %v", job.ID, closeErr)
+		}
+		if b := rewriteScope.Breach(); b != nil {
+			err = b
+		}
 		if err != nil {
 			fmt.Fprintf(out, "CI rewrite failed; keeping checked review: %v\n", err)
 		} else {
@@ -196,7 +225,7 @@ func (wp *WorkerPool) prepareCICheck(ctx context.Context, job *storage.ReviewJob
 	if err != nil {
 		return
 	}
-	checkout, closeCheckout, err := wp.createExactCheckout(ctx, "ci-checker", job)
+	checkout, closeCheckout, err := wp.createExactCheckout(ctx, "ci-checker", job, gitcmd.Runner{})
 	if err != nil {
 		return
 	}
@@ -453,7 +482,7 @@ func warmGoModules(ctx context.Context, checkout string, gitEnv []string, out io
 	warm := HiddenCommand(ctx, filepath.Join(paths[0], "bin", "go"), "mod", "download")
 	warm.Dir = checkout
 	warm.Env = gitEnv
-	if output, err := warm.CombinedOutput(); err != nil {
+	if output, err := proctrack.CombinedOutput(ctx, warm); err != nil {
 		fmt.Fprintf(out, "CI checker module warming failed: %v: %s\n", err, output)
 	}
 
@@ -472,19 +501,27 @@ func applyCICheck(doc structuredreview.Document, raw jsontext.Value, out io.Writ
 	if err := json.Unmarshal(raw, &response); err != nil {
 		return doc, fmt.Errorf("decode checker verdicts: %w", err)
 	}
-	counts, drops := make(map[int]int), make(map[int]bool)
+	verdicts := make(map[int][]structuredreview.CheckVerdict)
 	for _, v := range response.Verdicts {
 		encoded, _ := json.Marshal(v)
 		fmt.Fprintf(out, "CI checker verdict: %s\n", encoded)
-		counts[v.Finding]++
-		drops[v.Finding] = v.Keep != nil && !*v.Keep && strings.TrimSpace(v.Evidence) != "" && strings.TrimSpace(v.Reason) != ""
+		verdicts[v.Finding] = append(verdicts[v.Finding], structuredreview.CheckVerdict{
+			Keep: v.Keep, Evidence: strings.TrimSpace(v.Evidence), Reason: strings.TrimSpace(v.Reason),
+		})
 	}
+	check := &structuredreview.Check{Status: structuredreview.CheckCompleted}
 	kept := make([]structuredreview.Finding, 0, len(doc.Findings))
 	for i, f := range doc.Findings {
-		if counts[i+1] != 1 || !drops[i+1] {
+		// Drop only on one verdict that refutes the finding with evidence and a reason.
+		entry := structuredreview.CheckedFinding{Outcome: structuredreview.CheckKept, Finding: f, Verdicts: verdicts[i+1]}
+		if v := entry.Verdicts; len(v) == 1 && v[0].Keep != nil && !*v[0].Keep && v[0].Evidence != "" && v[0].Reason != "" {
+			entry.Outcome = structuredreview.CheckDropped
+		} else {
 			kept = append(kept, f)
 		}
+		check.Findings = append(check.Findings, entry)
 	}
+	doc.Check = check
 	if len(kept) == len(doc.Findings) {
 		return doc, nil
 	}

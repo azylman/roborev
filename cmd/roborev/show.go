@@ -123,13 +123,15 @@ func showCmd() *cobra.Command {
 The argument can be either a job ID (numeric) or a commit SHA.
 Job IDs are displayed in review notifications and the TUI.
 
-In a git repo, the argument is first tried as a git ref. If that fails
-and it's numeric, it's treated as a job ID. Use --job to force job ID.
+In a git repo, the argument is first tried as a git ref. A positive numeric
+argument is tried as a job ID if the ref cannot be resolved or has no review.
+When the ref has no review, a note on stderr reports the retry.
+Use --job to force job ID.
 
 Examples:
   roborev show              # Show review for HEAD
   roborev show abc123       # Show review for commit
-  roborev show 42           # Job ID (if "42" is not a valid git ref)
+  roborev show 42           # Git ref first, then job ID if no review
   roborev show --job 42     # Force as job ID even if "42" is a valid ref
   roborev show --prompt 42  # Show the prompt sent to the agent`,
 		Args: cobra.MaximumNArgs(1),
@@ -178,6 +180,8 @@ Examples:
 			// review row yet) can fall back to the job's stored prompt for
 			// jobs without reviews. -1 means "not applicable" (SHA lookups).
 			jobIDForPromptFallback := int64(-1)
+			var numericRefJobID int64
+			var numericRefArg string
 
 			if len(args) == 0 {
 				if forceJobID {
@@ -229,6 +233,10 @@ Examples:
 					}
 					query.Set("sha", sha)
 					displayRef = gitrepo.ShortSHA(sha)
+					if id, err := strconv.ParseInt(arg, 10, 64); resolvedSHA != "" && err == nil && id > 0 {
+						numericRefJobID = id
+						numericRefArg = arg
+					}
 				}
 			}
 
@@ -236,14 +244,35 @@ Examples:
 			if err != nil {
 				return fmt.Errorf("failed to connect to daemon (is it running?)")
 			}
+			if resp.StatusCode == http.StatusNotFound && numericRefJobID > 0 {
+				resp.Body.Close()
+				// Say which lookup missed, so a reader of the job review (or of
+				// the job error below) knows the commit was tried first.
+				fmt.Fprintf(cmd.ErrOrStderr(), "note: no review found for commit %s; trying job %s\n", displayRef, numericRefArg)
+				query.Del("sha")
+				query.Set("job_id", numericRefArg)
+				displayRef = "job " + numericRefArg
+				jobIDForPromptFallback = numericRefJobID
+				resp, err = newDaemonAPI(addr, client).GetReviewRaw(ctx, nil, roborevclient.WithQuery(query))
+				if err != nil {
+					return fmt.Errorf("failed to connect to daemon while looking up %s", displayRef)
+				}
+			}
 			defer resp.Body.Close()
 
 			var review storage.Review
+			skipped := false
 			if resp.StatusCode == http.StatusNotFound {
 				// Active, failed, and canceled jobs can have stored prompts
 				// without a review row. Use the job for prompt requests.
 				fallback := showPrompt && jobIDForPromptFallback >= 0 &&
 					fetchJobPromptReview(client, addr, jobIDForPromptFallback, &review)
+				// A skipped job has no review because no agent ran. Report
+				// the skip rather than a missing review.
+				if !showPrompt && jobIDForPromptFallback >= 0 {
+					skipped = fetchSkippedJobReview(client, addr, jobIDForPromptFallback, &review)
+					fallback = skipped
+				}
 				if !fallback {
 					return fmt.Errorf("no review found for %s", displayRef)
 				}
@@ -304,6 +333,11 @@ Examples:
 				return nil
 			}
 
+			if skipped {
+				fmt.Printf("Job %d was skipped: %s\n", review.JobID, review.Job.SkipReason)
+				return nil
+			}
+
 			// Avoid redundant "job X (job X, ...)" output
 			if strings.HasPrefix(displayRef, "job ") {
 				fmt.Printf("Review for %s (by %s)\n", displayRef, review.Agent)
@@ -361,6 +395,29 @@ Examples:
 	cmd.Flags().BoolVar(&showPrompt, "prompt", false, "show the prompt sent to the agent instead of the review output")
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "output as JSON")
 	return cmd
+}
+
+// fetchSkippedJobReview populates out with a skipped job, which has no review
+// because no agent ran. It reports false for any other job or lookup failure.
+func fetchSkippedJobReview(client *http.Client, addr string, jobID int64, out *storage.Review) bool {
+	resp, err := newDaemonAPI(addr, client).ListJobsRaw(context.Background(), &generated.ListJobsRequestOptions{Query: &generated.ListJobsQuery{ID: &jobID}})
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+	var result struct {
+		Jobs []storage.ReviewJob `json:"jobs"`
+	}
+	if err := json.UnmarshalRead(resp.Body, &result); err != nil || len(result.Jobs) == 0 ||
+		result.Jobs[0].Status != storage.JobStatusSkipped {
+		return false
+	}
+	job := result.Jobs[0]
+	*out = storage.Review{JobID: job.ID, Agent: job.Agent, Job: &job}
+	return true
 }
 
 // fetchJobPromptReview populates out from an active, failed, or canceled

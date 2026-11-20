@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/gofrs/flock"
+	"github.com/google/uuid"
 	"go.kenn.io/kit/atomicfile"
 )
 
@@ -24,6 +25,7 @@ type MuseAgent struct {
 	Model     string
 	Reasoning ReasoningLevel
 	Agentic   bool
+	SessionID string
 }
 
 func NewMuseAgent(command string) *MuseAgent {
@@ -34,8 +36,8 @@ func NewMuseAgent(command string) *MuseAgent {
 }
 
 func (a *MuseAgent) clone(opts ...agentCloneOption) *MuseAgent {
-	cfg := newAgentCloneConfig(a.Command, a.Model, a.Reasoning, a.Agentic, "", opts...)
-	return &MuseAgent{Command: cfg.Command, Model: cfg.Model, Reasoning: cfg.Reasoning, Agentic: cfg.Agentic}
+	cfg := newAgentCloneConfig(a.Command, a.Model, a.Reasoning, a.Agentic, a.SessionID, opts...)
+	return &MuseAgent{Command: cfg.Command, Model: cfg.Model, Reasoning: cfg.Reasoning, Agentic: cfg.Agentic, SessionID: cfg.SessionID}
 }
 
 func (a *MuseAgent) WithReasoning(level ReasoningLevel) Agent {
@@ -53,11 +55,25 @@ func (a *MuseAgent) WithModel(model string) Agent {
 	return a.clone(withClonedModel(model))
 }
 
+func (a *MuseAgent) WithSessionID(sessionID string) Agent {
+	return a.clone(withClonedSessionID(sessionID))
+}
+
 func (a *MuseAgent) Name() string        { return "muse" }
 func (a *MuseAgent) CommandName() string { return a.Command }
 
 func (a *MuseAgent) buildArgs(agentic bool, promptFile string) []string {
-	args := []string{"exec", "--no-session-log", "--contributor-mode", "off"}
+	return a.buildArgsWithSession(agentic, promptFile, a.SessionID)
+}
+
+func (a *MuseAgent) buildArgsWithSession(agentic bool, promptFile, sessionID string) []string {
+	args := []string{"exec"}
+	if sessionID != "" {
+		args = append(args, "--session-id", sessionID)
+	} else {
+		args = append(args, "--no-session-log")
+	}
+	args = append(args, "--contributor-mode", "off")
 	if a.Model != "" {
 		args = append(args, "--model", a.Model)
 	}
@@ -77,20 +93,27 @@ func (a *MuseAgent) CommandLine() string {
 }
 
 func (a *MuseAgent) PlanningCommandLine() string {
-	return a.Command + " " + strings.Join(a.buildArgs(false, "<prompt-file>"), " ")
+	return a.Command + " " + strings.Join(a.buildArgsWithSession(false, "<prompt-file>", ""), " ")
 }
 
 func (a *MuseAgent) Review(ctx context.Context, repoPath, commitSHA, prompt string, output io.Writer) (string, error) {
 	// Muse requires a real file for prompts that exceed argv limits.
 	agentic := effectiveAgentic(ctx, a.Agentic)
-	promptPath, env, cleanup, err := prepareMuseRun(prompt, agentic)
+	promptPath, env, cleanup, err := prepareMuseRunWithSession(prompt, agentic, a.SessionID)
 	if err != nil {
 		return "", err
 	}
 	defer cleanup()
+	sessionID := a.SessionID
+	if !planningReadOnly(ctx) && sessionID == "" {
+		sessionID = uuid.NewString()
+	}
+	if reporter, ok := output.(interface{ ReportSessionID(string) }); ok && sessionID != "" {
+		reporter.ReportSessionID(sessionID)
+	}
 	result, err := runStreamingCLI(ctx, streamingCLISpec{
 		Name: "muse", Command: a.Command,
-		Args: a.buildArgs(agentic, promptPath),
+		Args: a.buildArgsWithSession(agentic, promptPath, sessionID),
 		Dir:  repoPath, Env: env, Output: output, StreamStderr: true, DrainStdout: true,
 		Parse: parsePlainTextOutput,
 	})
@@ -115,18 +138,32 @@ func (a *MuseAgent) Review(ctx context.Context, repoPath, commitSHA, prompt stri
 // plugins. The private temp directory keeps Muse's runtime files out of the
 // system temp directory that holds planning worktrees.
 func prepareMuseRun(prompt string, agentic bool) (string, []string, func(), error) {
+	return prepareMuseRunWithSession(prompt, agentic, "")
+}
+
+func prepareMuseRunWithSession(prompt string, agentic bool, resumeSessionID string) (string, []string, func(), error) {
 	promptPath, cleanupPrompt, err := createPromptFile("muse", prompt)
 	if err != nil || agentic {
 		return promptPath, nil, cleanupPrompt, err
 	}
 	src := filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "muse")
-	if os.Getenv("XDG_CONFIG_HOME") == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
+	home := ""
+	if os.Getenv("XDG_CONFIG_HOME") == "" || os.Getenv("XDG_DATA_HOME") == "" {
+		var homeErr error
+		home, homeErr = os.UserHomeDir()
+		if homeErr != nil && os.Getenv("XDG_CONFIG_HOME") == "" {
 			cleanupPrompt()
-			return "", nil, nil, fmt.Errorf("resolve muse config home: %w", err)
+			return "", nil, nil, fmt.Errorf("resolve muse config home: %w", homeErr)
 		}
+	}
+	if os.Getenv("XDG_CONFIG_HOME") == "" {
 		src = filepath.Join(home, ".config", "muse")
+	}
+	userDataMuseDir := ""
+	if xdgData := os.Getenv("XDG_DATA_HOME"); xdgData != "" {
+		userDataMuseDir = filepath.Join(xdgData, "muse")
+	} else if home != "" {
+		userDataMuseDir = filepath.Join(home, ".local", "share", "muse")
 	}
 	dir, err := os.MkdirTemp("", "roborev-muse-config-*")
 	if err != nil {
@@ -134,7 +171,8 @@ func prepareMuseRun(prompt string, agentic bool) (string, []string, func(), erro
 		return "", nil, nil, fmt.Errorf("create muse config dir: %w", err)
 	}
 	cleanupAuth := func() {}
-	cleanup := func() { cleanupAuth(); cleanupPrompt(); _ = os.RemoveAll(dir) }
+	cleanupSessions := func() {}
+	cleanup := func() { cleanupAuth(); cleanupSessions(); cleanupPrompt(); _ = os.RemoveAll(dir) }
 	configDir := filepath.Join(dir, ".config")
 	dataDir := filepath.Join(dir, "data")
 	cacheDir := filepath.Join(dir, "cache")
@@ -166,7 +204,64 @@ func prepareMuseRun(prompt string, agentic bool) (string, []string, func(), erro
 		cleanup()
 		return "", nil, nil, fmt.Errorf("copy muse config: %w", err)
 	}
+	if userDataMuseDir != "" {
+		userSessionsDir := filepath.Join(userDataMuseDir, "sessions")
+		privateSessionsDir := filepath.Join(dataDir, "muse", "sessions")
+		if resumeSessionID != "" {
+			if info, statErr := os.Stat(userSessionsDir); statErr == nil && info.IsDir() {
+				_ = copyMuseSessionByID(userSessionsDir, privateSessionsDir, resumeSessionID)
+			}
+		}
+		cleanupSessions = func() {
+			if info, statErr := os.Stat(privateSessionsDir); statErr == nil && info.IsDir() {
+				_ = copyMuseSessionsTree(privateSessionsDir, userSessionsDir)
+			}
+		}
+	}
 	return promptPath, append(os.Environ(), "HOME="+dir, "USERPROFILE="+dir, "XDG_CONFIG_HOME="+configDir, "XDG_DATA_HOME="+dataDir, "XDG_CACHE_HOME="+cacheDir, "TMPDIR="+tmpDir, "TMP="+tmpDir, "TEMP="+tmpDir), cleanup, nil
+}
+
+func copyMuseSessionByID(srcSessionsDir, dstSessionsDir, sessionID string) error {
+	return filepath.WalkDir(srcSessionsDir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if !d.IsDir() || d.Name() != sessionID {
+			return nil
+		}
+		rel, err := filepath.Rel(srcSessionsDir, path)
+		if err != nil {
+			return err
+		}
+		return copyMuseSessionsTree(path, filepath.Join(dstSessionsDir, rel))
+	})
+}
+
+func copyMuseSessionsTree(srcDir, dstDir string) error {
+	return filepath.WalkDir(srcDir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, err := filepath.Rel(srcDir, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dstDir, rel)
+		if d.IsDir() {
+			return os.MkdirAll(target, 0o700)
+		}
+		if !d.Type().IsRegular() || filepath.Base(path) == ".session.lock" {
+			return nil
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+			return err
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		return atomicfile.WriteFile(target, data, atomicfile.WithPrivate(), atomicfile.WithFollowLink())
+	})
 }
 
 // writeBackMuseAuth saves a login Muse renewed in the private home, unless

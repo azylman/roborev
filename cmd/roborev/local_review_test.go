@@ -150,6 +150,29 @@ func TestLocalReviewWithDirtyDiff(t *testing.T) {
 	h.assertOutputContains("No issues found.")
 }
 
+func TestLocalReviewBuiltInBinaryEvidence(t *testing.T) {
+	repo := testutil.NewTestRepoWithCommit(t)
+	require.NoError(t, os.WriteFile(filepath.Join(repo.GitDir, "info", "attributes"), []byte("*.pdf -diff\n"), 0o644))
+	head := repo.CommitFile("exhibit.pdf", "%PDF\x00committed", "add exhibit")
+	require.NoError(t, os.WriteFile(filepath.Join(repo.Root, ".roborev.toml"), []byte("[review]\nbinary_evidence = true\n"), 0o644))
+
+	var capturedPrompt string
+	a := &agent.FakeAgent{
+		NameStr: "local-evidence",
+		ReviewFn: func(_ context.Context, _, _ string, prompt string, _ io.Writer) (string, error) {
+			capturedPrompt = prompt
+			return `{"schema_version":3,"verdict":"pass","summary":"No findings.","findings":[]}`, nil
+		},
+	}
+	agent.RegisterForTest(t, a)
+	cmd := reviewCmd()
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{"--local", "--repo", repo.Root, "--agent", a.Name(), head})
+	require.NoError(t, cmd.Execute())
+	assert.Contains(t, capturedPrompt, "Committed review evidence")
+}
+
 func TestLocalReviewRetainsLocationsForDirtyBranch(t *testing.T) {
 	repo := testutil.NewTestRepoWithCommit(t)
 	base := repo.HeadSHA()
@@ -366,4 +389,24 @@ func TestFreezeReviewRefResolvesEachEndToACommit(t *testing.T) {
 
 	_, err := freezeReviewRef(t.Context(), repo.Path(), "no-such-ref")
 	assert.Error(t, err)
+}
+
+// A local review of a commit whose only changes are excluded is skipped with a
+// reason. It must not print the agent's "no issues" answer to an empty diff,
+// which reads exactly like a passing review, and it is not a failure either.
+func TestLocalReviewSkipsWhenNothingIsReviewable(t *testing.T) {
+	repo := testutil.NewTestRepoWithCommit(t)
+	repo.CommitFile(".roborev.toml", "exclude_patterns = [\"*.md\"]\n", "exclude docs")
+	repo.CommitFile("README.md", "docs\n", "docs only")
+	cmd := reviewCmd()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetArgs([]string{"--local", "--repo", repo.Root, "--agent", "test"})
+
+	require.NoError(t, cmd.Execute())
+
+	assert.Contains(t, out.String(), "Skipped: nothing to review in")
+	assert.Contains(t, out.String(), "the only changed file is excluded")
+	assert.NotContains(t, out.String(), "No issues found")
 }

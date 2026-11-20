@@ -22,6 +22,47 @@ import (
 	"go.kenn.io/roborev/pkg/structuredreview"
 )
 
+func TestExportReviewsReportsSourceMachine(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+	defer db.Close()
+	repo := createRepo(t, db, filepath.Join(t.TempDir(), "repo"))
+	legacy := seedCompletedExportReview(t, db, repo.ID, "2222222222222222222222222222222222222222", "2026-06-29 00:00:01", false)
+	// Older enqueue code could store an empty ID when machine ID lookup failed.
+	_, err := db.ExecContext(t.Context(), `UPDATE review_jobs SET source_machine_id = '' WHERE id = ?`, legacy.JobID)
+	require.NoError(t, err)
+	zeroSource := seedCompletedExportReview(t, db, repo.ID, "3333333333333333333333333333333333333333", "2026-06-29 00:00:02", false)
+	_, err = db.ExecContext(t.Context(), `UPDATE review_jobs SET source_machine_id = ? WHERE id = ?`, uuid.Nil(), zeroSource.JobID)
+	require.NoError(t, err)
+	machineID, err := db.GetMachineID()
+	require.NoError(t, err)
+	remoteID := testUUID("machine-a")
+	now := time.Now().UTC().Truncate(time.Second)
+	job := PulledJob{UUID: testUUID("pulled-job"), RepoIdentity: repo.RootPath, GitRef: "HEAD", Agent: "test", JobType: JobTypeReview, Status: string(JobStatusDone), SourceMachineID: remoteID, EnqueuedAt: now, UpdatedAt: now}
+	require.NoError(t, db.UpsertPulledJob(job, repo.ID, nil))
+	pulledID := testUUID("pulled-review")
+	require.NoError(t, db.UpsertPulledReview(PulledReview{
+		UUID: pulledID, JobUUID: job.UUID, JobEnqueuedAt: now, JobSourceMachineID: remoteID,
+		Agent: "test", StructuredOutput: reviewFixtureJSON("No issues found."), VerdictBool: new(true),
+		UpdatedByMachineID: machineID, CreatedAt: now, UpdatedAt: now,
+	}))
+	for _, profile := range []ExportProfile{ExportProfileContent, ExportProfileMetadata} {
+		t.Run(string(profile), func(t *testing.T) {
+			page, err := db.ExportReviews(ExportReviewsOptions{Profile: profile})
+			require.NoError(t, err)
+			require.Len(t, page.Reviews, 3)
+			byID := make(map[uuid.UUID]ExportReview)
+			for _, review := range page.Reviews {
+				byID[review.ReviewID] = review
+				assert.Equal(t, machineID, review.ExportedByMachineID)
+			}
+			assert.Equal(t, machineID, byID[*legacy.UUID].SourceMachineID)
+			assert.Equal(t, machineID, byID[*zeroSource.UUID].SourceMachineID)
+			assert.Equal(t, remoteID, byID[pulledID].SourceMachineID)
+		})
+	}
+}
+
 func TestExportReviewsPagesUseCompletedIndex(t *testing.T) {
 	t.Parallel()
 	db := openTestDB(t)
@@ -1181,17 +1222,7 @@ func TestExportLegacyDocumentSchema(t *testing.T) {
 	assert.Equal(t, *review.UUID, page.Reviews[0].ReviewID)
 	raw, err := json.Marshal(page.Reviews[0].Document)
 	require.NoError(t, err)
-	registry := huma.NewMapRegistry("#/components/schemas/", huma.DefaultSchemaNamer)
-	schema := (ExportDocument{}).Schema(registry)
-	schemaJSON, err := json.Marshal(schema)
-	require.NoError(t, err)
-	var spec jsonschema.Schema
-	require.NoError(t, json.Unmarshal([]byte(strings.ReplaceAll(string(schemaJSON), "#/components/schemas/", "#/$defs/")), &spec))
-	definitions, err := json.Marshal(registry.Map())
-	require.NoError(t, err)
-	require.NoError(t, json.Unmarshal([]byte(strings.ReplaceAll(string(definitions), "#/components/schemas/", "#/$defs/")), &spec.Defs))
-	validator, err := spec.Resolve(nil)
-	require.NoError(t, err)
+	validator := exportDocumentValidator(t)
 
 	for _, wire := range []string{string(raw), `{"schema_version":0,"legacy":{"markdown":"Original text.","recorded_verdict":null}}`} {
 		var value any
@@ -1211,6 +1242,75 @@ func TestExportLegacyDocumentSchema(t *testing.T) {
 	var mixed any
 	require.NoError(t, json.Unmarshal([]byte(`{"schema_version":0,"summary":"Invented structured summary","findings":[],"legacy":{"markdown":"Original text.","recorded_verdict":null}}`), &mixed))
 	assert.Error(t, validator.Validate(mixed))
+}
+
+// exportDocumentValidator resolves the published export document schema.
+func exportDocumentValidator(t *testing.T) *jsonschema.Resolved {
+	t.Helper()
+	registry := huma.NewMapRegistry("#/components/schemas/", huma.DefaultSchemaNamer)
+	schema := (ExportDocument{}).Schema(registry)
+	schemaJSON, err := json.Marshal(schema)
+	require.NoError(t, err)
+	var spec jsonschema.Schema
+	require.NoError(t, json.Unmarshal([]byte(strings.ReplaceAll(string(schemaJSON), "#/components/schemas/", "#/$defs/")), &spec))
+	definitions, err := json.Marshal(registry.Map())
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal([]byte(strings.ReplaceAll(string(definitions), "#/components/schemas/", "#/$defs/")), &spec.Defs))
+	validator, err := spec.Resolve(nil)
+	require.NoError(t, err)
+	return validator
+}
+
+// exportTestCheckedDocument is a combined review after the CI checker kept
+// one finding and dropped another. One verdict has no reason, and the dropped
+// finding has no location.
+const exportTestCheckedDocument = `{"schema_version":3,"summary":"1 finding.","verdict":"fail","source_labels":["codex"],"findings":[` +
+	`{"severity":"high","kind":"defect","topic":null,"confidence":0.9,"problem":"Saves lose data.","fix":"Flush before rename.","file":"save.go","start_line":10,"end_line":12,"location":"save.go:10-12","sources":[1]}],` +
+	`"check":{"status":"completed","findings":[` +
+	`{"outcome":"kept","finding":{"severity":"high","kind":"defect","topic":null,"confidence":0.9,"problem":"Saves lose data.","fix":"Flush before rename.","file":"save.go","start_line":10,"end_line":12,"location":"save.go:10-12","sources":[1]},"verdicts":[{"keep":true,"evidence":"go test ./save: FAIL"}]},` +
+	`{"outcome":"dropped","finding":{"severity":"medium","kind":"defect","topic":null,"confidence":0.6,"problem":"Build breaks.","fix":"Add the import.","file":null,"start_line":null,"end_line":null,"location":null,"sources":[1]},"verdicts":[{"keep":false,"evidence":"go build ./...: ok","reason":"The import exists."}]}]}}`
+
+func TestExportReviewsCheckedDocumentMatchesSchema(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+	defer db.Close()
+	assert := assert.New(t)
+
+	repo := createRepo(t, db, filepath.Join(t.TempDir(), "repo"))
+	review := seedCompletedExportReview(t, db, repo.ID, "2222222222222222222222222222222222222222", "2026-06-29 00:00:00", false)
+	setExportReviewStructuredOutput(t, db, review.JobID, exportTestCheckedDocument)
+
+	page, err := db.ExportReviews(ExportReviewsOptions{Profile: ExportProfileContent, Limit: 10})
+	require.NoError(t, err)
+	require.Len(t, page.Reviews, 1)
+	got := page.Reviews[0].Document
+	require.NotNil(t, got)
+	require.NotNil(t, got.Check, "export keeps the checker record")
+	raw, err := json.Marshal(got)
+	require.NoError(t, err)
+	assert.JSONEq(exportTestCheckedDocument, string(raw))
+	assert.NotContains(derefString(page.Reviews[0].Content), "go build", "content stays the review Markdown")
+
+	var value any
+	require.NoError(t, json.Unmarshal(raw, &value))
+	assert.NoError(exportDocumentValidator(t).Validate(value))
+
+	var decoded generated.ExportReview_Document
+	require.NoError(t, json.Unmarshal(raw, &decoded))
+	require.NotNil(t, decoded.ExportReview_Document_OneOf)
+	require.True(t, decoded.ExportReview_Document_OneOf.IsA())
+	require.NoError(t, decoded.Validate())
+	check := decoded.ExportReview_Document_OneOf.A.Check
+	require.NotNil(t, check, "the generated client reads the checker record")
+	require.Len(t, check.Findings, 2)
+	dropped := check.Findings[1]
+	assert.Equal(structuredreview.CheckDropped, dropped.Outcome)
+	assert.Equal("Build breaks.", dropped.Finding.Problem)
+	require.Len(t, dropped.Verdicts, 1)
+	assert.Equal(new(false), dropped.Verdicts[0].Keep)
+	assert.Equal(new("go build ./...: ok"), dropped.Verdicts[0].Evidence)
+	assert.Equal(new("The import exists."), dropped.Verdicts[0].Reason)
+	assert.Nil(check.Findings[0].Verdicts[0].Reason, "a blank verdict member is omitted")
 }
 
 func TestExportReviewsUnknownLegacyVerdict(t *testing.T) {

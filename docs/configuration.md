@@ -1,5 +1,5 @@
 ---
-last_edited: 2026-10-31
+last_edited: 2026-11-19
 title: Configuration
 description: Configure roborev behavior globally and per-repository
 ---
@@ -34,12 +34,18 @@ section invalid and keeps the file unchanged.
 ## CI comment display
 
 The GitHub daemon poller accepts `[ci] comment_max_findings` (integer, default
-`0` for unlimited) and `comment_when_clean` (boolean, default `true`). Repo
-values override global values, including explicit `0` and `true` resets.
-Negative caps are rejected. These settings affect synthesized GitHub comments
-only; they preserve complete stored reviews, verdicts, and prompts. Prose is
-uncapped, and raw fallback comments, daemon-free CI, and GitLab retain their
-existing behavior. See
+`0` for unlimited), `comment_when_clean` (boolean, default `true`), and
+`comment_min_confidence` (optional finite number from `0` to `1`, unset globally
+disables filtering). An unset repo floor inherits the global floor. Set it to
+`0` to disable filtering for that repo. The floor uses confidence recorded by
+synthesis. Findings with no stored score remain visible. Synthesis is instructed
+to use `0.5` when no source scored a finding, so a floor above `0.5` can hide
+it. With `comment_when_clean = false`, an empty comment can be suppressed even
+when the stored review has findings. Negative caps and invalid confidence floors
+are rejected during loading, saving, and reloading. These settings affect
+synthesized GitHub comments only; they preserve complete stored reviews,
+verdicts, and prompts. Prose is uncapped, and raw fallback comments, daemon-free
+CI, and GitLab retain their existing behavior. See
 [Comment display policy](/docs/integrations/github/#comment-display-policy) for
 filtering, complete review retrieval, silent upsert, and status permissions.
 
@@ -623,6 +629,16 @@ The fallback hierarchy for each workflow is:
     `{workflow}_agent_{level}`** > **global `{workflow}_agent`** > **global
     `default_agent`** > `codex`
 
+A workflow model belongs to the agent that its workflow and level resolve to
+without a CLI flag. When `--agent` or a panel member's `agent` selects a
+different agent and no `--model` is given, roborev does not pass that workflow
+model to it, because agents reject models they do not know. A generic `model` or
+`default_model` still applies when the selected agent is the default agent.
+Otherwise the selected agent runs on its own default model, and an ACP agent
+uses its `[acp.<name>].model`. For example, with `default_agent = "codex"` and
+`review_model = "gpt-5.5"`, `roborev review --agent claude-code` runs Claude
+Code on its default model.
+
 #### Per-type `[analyze.<type>]` override
 
 Some review types have no dedicated `{type}_agent` / `{type}_model` keys. Those
@@ -649,6 +665,15 @@ Types that have them — `review`, `refine`, `fix`, `security`, `design` — ign
 `roborev analyze security` never changes `roborev review --type security`.
 Reasoning is unaffected by this block for reviews; it follows `review_reasoning`
 (the block's `reasoning` field applies only to `roborev analyze <type>` runs).
+
+### Binary Evidence
+
+Set `[review] binary_evidence = true` in global or repository configuration to
+include committed changed binary files in built-in reviews. It defaults to
+false; the repository setting overrides the global setting. Custom types use
+their own independent setting. Built-in reviews of uncommitted changes omit the
+evidence. See [Binary evidence](advanced/custom-review-types.md#binary-evidence)
+for details and limitations.
 
 ### Custom Review Types
 
@@ -765,7 +790,9 @@ reference.
 Use a named experiment to compare the normal review configuration with one
 configuration overlay. Roborev deterministically assigns a repository-scoped
 source branch to the default or experimental arm, so new commits on that branch
-stay in the same arm.
+stay in the same arm. CI reviews of
+[commits on the default branch](/docs/integrations/github/#review-commits-on-the-default-branch)
+have no source branch, so each landed commit is assigned on its own.
 
 ```toml
 [experiments.review-session-resumption-v1]
@@ -901,6 +928,7 @@ opencode_cmd = "/usr/local/bin/opencode-wrapper"
 pi_cmd = "~/bin/pi"
 grok_cmd = "/opt/bin/grok"
 muse_cmd = "/opt/bin/muse"
+droid_cmd = "/opt/bin/droid-wrapper"
 ```
 
 | Option | Default command |
@@ -913,6 +941,7 @@ muse_cmd = "/opt/bin/muse"
 | `pi_cmd` | `pi` |
 | `grok_cmd` | `grok` |
 | `muse_cmd` | `muse` |
+| `droid_cmd` | `droid` |
 
 These overrides affect both agent execution and availability detection. Without
 them, roborev only checks for the default command name when deciding whether an
@@ -991,6 +1020,12 @@ exclude_patterns = ["*.min.js", "dist/"]
 Patterns can be filenames, directory names (with trailing `/`), or glob patterns
 (including `**`). Both global and repo-level patterns are merged. User patterns
 are appended to the built-in exclusion list.
+
+A commit or range review whose changed files are all excluded is skipped with a
+"nothing to review" reason, without a verdict, because no reviewer saw any code.
+This applies to local, daemon, and CI reviews; the CI poller publishes "Review
+skipped: nothing to review" on the pull request. Changed lockfiles still count,
+since the prompt lists them.
 
 !!! note
 
@@ -1173,9 +1208,18 @@ remains available.
 
 Isolated agents see committed files, without the source checkout's local edits,
 untracked files, or ignored build artifacts. Creating the checkout adds disk use
-and setup time; submodules and Git LFS files are prepared as for CI reviews.
-Checkout failures follow the normal job retry policy without falling back to
-running the agent in the source worktree.
+and setup time, because the daemon initializes submodules and pulls Git LFS
+files in it. Checkout failures follow the normal job retry policy without
+falling back to running the agent in the source worktree.
+
+Checkout setup uses your normal Git configuration, as
+[refine's worktree](guides/auto-fixing.md#requirements) does. Credential
+helpers, `url.insteadOf` rewrites, and proxy settings from your global and
+system config apply, so private submodules clone the same way they do for you.
+Terminal prompts and askpass stay disabled, so the credential source has to be
+non-interactive, and Git hooks do not run during setup. CI review checkouts keep
+an isolated Git configuration, because they can check out pull requests from
+forks.
 
 Dirty reviews and their synthesis jobs continue to use the source checkout.
 Tasks, compact jobs, and background fixes keep their existing behavior. CI
@@ -1227,6 +1271,7 @@ filter_branch = false             # Show all branches on startup (default: curre
 | `web.auth_token` | string | - | Base64url-encoded 32-byte random token exchanged for a process-local browser session | No |
 | `web.auth_token_file` | string | - | Host-local file containing the browser token; mutually exclusive with `web.auth_token` | No |
 | `max_workers` | int | 4 | Number of parallel review workers. On reload, the daemon starts new workers right away; when the number drops, busy workers finish their current job before stopping. Starting the daemon with `--workers` fixes the count until restart | Yes |
+| `agent_memory_max_mb` | int | 0 | Fail a job when the resident memory (RSS) of its processes, added together, exceeds this many MiB. The daemon samples every 2 seconds, stops the job's processes, and fails the job without retry or backup agent; a breach in the CI checker keeps the finished review and marks its check failed. Shared pages count once per process, so the sum can read well above actual use. A job can overshoot between samples; wrap the daemon in a cgroup limit for a hard cap. A change applies to the next job. 0 disables the limit. Linux and macOS only | Yes |
 | `job_timeout_minutes` | int | 30 | Per-job timeout in minutes of wall-clock time, so time the machine spends asleep counts against it. Plan-first background fixes add an equal planning budget | Yes |
 | `isolate_reviews` | bool | false | Run committed reviews in daemon-owned detached checkouts; see [Isolated Review Checkouts](#isolated-review-checkouts) | Yes |
 | `hook_timeout_seconds` | int | `3` (`30` on Windows) | Post-commit hook request timeout, in seconds. Raise it on Windows or large repos where the daemon's enqueue git calls are slow. Zero or negative values are ignored and fall back to the platform default | Yes |
@@ -1267,6 +1312,7 @@ filter_branch = false             # Show all branches on startup (default: curre
 | `pi_cmd` | string | `pi` | Custom path or name for the Pi binary | Yes |
 | `grok_cmd` | string | `grok` | Custom path or name for the Grok Build binary | Yes |
 | `muse_cmd` | string | `muse` | Custom path or name for the Muse Code binary | Yes |
+| `droid_cmd` | string | `droid` | Custom path or name for the Factory Droid binary | Yes |
 | `exclude_patterns` | array | `[]` | Filenames or glob patterns to exclude from review diffs globally | Yes |
 | `default_max_prompt_size` | int | 204800 | Default inline prompt budget in bytes before file handoff | Yes |
 
@@ -2003,171 +2049,21 @@ systemctl --user enable --now roborev
 |----------|-------------|
 | `ROBOREV_DATA_DIR` | Override default data directory (`~/.roborev`) |
 | `ROBOREV_COLOR_MODE` | Color theme: `auto` (default), `dark`, `light`, `none`. See [Color Mode](#color-mode) |
-| `ROBOREV_TELEMETRY_ENABLED` | Set to `0` to disable anonymous telemetry |
-| `TELEMETRY_ENABLED` | Generic telemetry opt-out. Set to `0` to disable telemetry |
-| `DO_NOT_TRACK` | Set to `1` to disable telemetry |
+| `ROBOREV_TELEMETRY_ENABLED` | Set to `0` to turn off usage telemetry. See [Usage Reporting](#telemetry) |
+| `TELEMETRY_ENABLED` | Set to `1` to turn on usage telemetry, or `0` to turn it off |
+| `DO_NOT_TRACK` | Set to `1` to turn off usage telemetry |
 | `VOYAGE_API_KEY` | Example credential source for Voyage when named by `search.embeddings.api_key = { env = "VOYAGE_API_KEY" }` |
 | `NO_COLOR` | Set to any value to disable all color output ([no-color.org](https://no-color.org)) |
 
-### Telemetry
+### Usage Reporting {#telemetry}
 
-Release builds of roborev send limited anonymous telemetry when the daemon
-starts and once every 24 hours while it remains running. Events are
-`daemon_started` and `daemon_active`, with `repo_count` and `review_count` as
-buckets: `0-5`, `6-20`, `21-100`, or `over-100`. These events also include
-whether sync is enabled, whether CI is enabled, whether auto design review is
-enabled, roborev version, OS, architecture, and an anonymous install ID stored
-in the local database.
-
-The daemon sends `setup_finished` once per install the first time it finds a
-finished review: one that ran locally, arrived through sync, or already existed
-when the daemon started. Panel member reviews count. The event has no
-properties. Its timestamp records when the daemon noticed the review, so it can
-come after an upgrade or after telemetry is turned on. If sending fails, the
-daemon does not retry.
-
-Closing a browser tab, leaving it hidden for 30 minutes, or exiting the TUI
-reports one `session_ended` with `surface` and `duration_bucket`: `under_1m`,
-`1_to_5m`, `5_to_30m`, or `over_30m`. Each browser session adds up visible time
-across tab switches and excludes hidden time. A browser session is lost when the
-browser quits, crashes, or discards the tab before the page closes normally.
-
-The web UI asks the daemon to report anonymous `app_opened` once per UTC day per
-browser profile, on load or focus. `roborev tui` asks each time it starts.
-Commands that work through the daemon, such as `roborev review`,
-`roborev job list` and `roborev job show`, ask once their first daemon request
-succeeds, and they never start a daemon to do so. Git hook, agent hook, MCP and
-daemon management commands never report it. Commands run by the bundled agent
-skills pass `--from-skill` and count as agent activity. Unmarked eligible
-commands still count as app opens. The daemon sends `app_opened` with the same
-install ID, version, OS and architecture plus `surface`, which is `web`, `tui`
-or `cli` and nothing else. It sends at most one `app_opened` per surface per UTC
-day, so repeated loads, tabs, launches and commands on the same day count once.
-It forgets which surfaces it sent on restart. The browser, the TUI and the CLI
-never contact PostHog. The same environment variables turn it off; the daemon
-reads them, and so do the `roborev tui` and CLI processes.
-
-After a `disabled` receipt, the browser sends nothing until a later UTC day's
-load or focus checks again. A TUI, CLI, or MCP process stops reporting until the
-next UTC day, a TUI reconnect, or its own restart. The agent-call route returns
-the same `disabled`, `queued`, or `skipped` JSON receipt as the event route, and
-returns an error if recording or capture fails.
-
-Agent activity counts each MCP `tools/call`, including tool errors, and each
-invocation of `agent-hook run`, `agent-hook fix-done`, `post-commit`, `enqueue`,
-`remap`, or an eligible daemon command marked `--from-skill` after its first
-successful product request. MCP initialization, discovery and keepalives add
-nothing. Git post-rewrite hooks run `remap`; post-commit and pre-push hooks run
-`post-commit`. Hooks that do no daemon work add nothing.
-
-The daemon emits `agent_active` once per install per UTC day with
-`call_count_bucket=1-10`. It emits `agent_call_count` only on calls 11 and 101,
-with `11-100` and `over-100`. Use the highest bucket observed per install and
-UTC day for volume. The local daily count survives daemon restarts in the
-existing database, without a schema migration. These events add no `app_opened`
-events. Each threshold claims one delivery attempt, even if capture fails.
-Delivery is best effort and honors all opt-outs. Failed delivery isn't retried.
-CLI and stdio MCP notifications and TUI exit reports use a one-second request
-timeout. CLI commands, stdio MCP sessions, and the TUI wait up to 50 ms at exit
-for unfinished reports. Finished reports add no delay. An unfinished report may
-be lost when the process exits. Telemetry alone never starts a daemon.
-
-Core actions report `review_viewed`, `finding_fixed`, and `review_closed`, each
-at most once per installation, surface, and UTC day. All carry `surface`. Reads
-and closes support web, TUI and CLI; fixes support TUI and CLI. Reads include
-review, synthesis and compact output.
-
-- The TUI counts a read on key or mouse input while a loaded review is visible.
-    Opening a review isn't a read until the next input. Quit keys `ctrl+c` and
-    `ctrl+d` stay silent; `q` on a loaded review counts. A transport error or
-    successful daemon reconnect allows another report on later input.
-- The browser sends a rendered review read once per UTC day per browser profile,
-    across reloads and window focus returns. It keeps daily telemetry claims in
-    localStorage.
-- CLI reads include `show`, `wait`, `review --wait`, `compact --wait`, and
-    nonquiet `fix` output. CLI fixes from `fix`, `refine`, and `analyze --fix`
-    report `finding_fixed` when they commit. CLI actions require terminal output
-    and exclude agents and `--from-skill`.
-- Successful reopens, automatic closes, prompt reads, and analysis reads stay
-    silent.
-- With a remote `--server`, CLI events use an already-running local daemon and
-    its installation ID. Without a local daemon, events are dropped. Reporting
-    never starts a daemon.
-
-Core action error banners and toasts in the web UI and TUI send `error_shown`
-with `surface=web|tui` and `kind=review_viewed|finding_fixed|review_closed`,
-without a daily limit. A TUI error counts when its flash or pane first appears
-on screen; a flash for another view that expires unseen stays silent.
-
-- `review_viewed` counts a review that fails to load or render, including the
-    TUI split pane's load error. A failure counts once per selection; reloads
-    and background retries that show the same failure stay silent until the
-    review loads, the selection changes, or the user opens or retries it.
-- Failed closes and reopens both count as `review_closed`. A close that succeeds
-    but whose refreshed review can't load also counts.
-- Failed agent jobs, missing reviews, and CLI errors stay silent.
-- Daemon-unreachable errors can't be counted because reporting uses the daemon.
-
-The daemon sends `sync_failed` when a full sync pass fails after a successful
-pass in the same process, once per PostgreSQL outage, with
-`sync_source=postgres` and `reason=auth|network|timeout|other`. A full push and
-pull that reaches PostgreSQL allows the next outage to report, even when
-row-specific data errors (SQLSTATE class 22 or 23) rejected some rows. Those
-data errors, local SQLite errors, rows that fail local checks or conflict with
-an existing experiment, and configuration errors never report an outage on their
-own. A PostgreSQL failure seen earlier in a pass still reports when the pass
-stops for one of those reasons. Outage state resets when the daemon restarts;
-reporting resumes after a full pass succeeds. Unlisted `kind`, `reason`, and
-`sync_source` values become `other`. Neither event contains error text.
-
-The daemon deduplicates successful core action reports per day, so clients may
-repeat them.
-
-The browser reports `search_empty` with only `surface=web` each time an
-Enter-submitted search returns no jobs. The CLI reports it with `surface=cli`
-when a human search finds no reviews, under the same terminal and agent rules as
-other CLI actions. Debounced previews stay silent, and search text is excluded.
-
-The browser and TUI also report `screen_viewed` with a fixed `screen` name and
-`surface` of `web` or `tui`. Browser screens are `reviews` and `analytics`. TUI
-screens are `queue`, `review`, `prompt`, `filter`, `comment`, `commit-msg`,
-`help`, `log`, `tasks`, `worktree-confirm`, `patch`, `column-options`,
-`release-notes` and `rerun-agent`. Each screen counts once per install per UTC
-day across interfaces, including daemon restarts. Screen names contain no paths,
-job IDs, filter text or review contents. Daily screen claims live in
-`telemetry-daily.json` beside the daemon database, wherever `--db` points, with
-a `telemetry-daily.json.lock` sidecar. An unreadable or newer-version claims
-file makes `screen_viewed` and core action reports fail until it's removed. Stop
-the daemon before deleting it. Deletion resets file claims; existing SQLite
-claims remain effective through their recorded UTC dates. Counts mean the report
-was queued, not confirmed delivered to PostHog. The TUI retries a failed screen
-report on the next key or mouse input while that screen is showing. The browser
-sends each screen and review read once per UTC day per browser profile, across
-reloads and focus returns.
-
-Each event carries `install_age_hours`, the whole hours since the install ID was
-created, so short-lived installs such as test sandboxes can be filtered out.
-Installs created before roborev recorded that time send events without it.
-
-Each event also carries `distribution`, the channel that built the binary, such
-as `homebrew` or `kenn` for official direct downloads. It's empty for source
-builds.
-
-Telemetry does not include repo names, paths, remotes, prompts, review output,
-provider tokens, usernames, or IP geolocation. It's always off in CI. Disable it
-with any of these environment variables:
-
-```bash
-ROBOREV_TELEMETRY_ENABLED=0 roborev daemon run
-TELEMETRY_ENABLED=0 roborev daemon run
-DO_NOT_TRACK=1 roborev daemon run
-ROBOREV_TELEMETRY_ENABLED=0 roborev tui
-ROBOREV_TELEMETRY_ENABLED=0 roborev review
-```
-
-Release builds, `make build`, and `make install` set the PostHog project key at
-link time. Plain `go build` and `go install` builds and Go test processes have
-no key and send no telemetry.
+roborev can send general, anonymous usage telemetry. Usage telemetry is off
+unless you have opted in or set `TELEMETRY_ENABLED=1`. Any of these turns it
+off, even after you opted in: `ROBOREV_TELEMETRY_ENABLED=0`,
+`TELEMETRY_ENABLED=0`, `DO_NOT_TRACK=1`, or `CI` set to any value. The daemon
+reads these from its own environment when it starts, so set them where the
+daemon starts, such as its launchd or systemd service, and restart it.
+Development builds never send it.
 
 ### Color Mode
 
@@ -2281,6 +2177,15 @@ timeout = "2s"
 with the agent session ID. If both `endpoint` and `agentsview.url` are empty,
 roborev uses the `agentsview` CLI path. `timeout` defaults to `10s`; invalid,
 zero, or negative values also fall back to `10s`.
+
+If neither HTTP provider is configured and `agentsview` is missing from the
+daemon's PATH, `roborev status` reports an unhealthy `cost` component. The
+daemon also logs one actionable warning at startup. Health checks use the
+current configuration, so configuring a provider clears this warning from
+status. A missing cost source makes overall health unhealthy but does not block
+readiness or hide CI recovery information, because reviews can still run. This
+availability check does not execute the CLI, read usage data, or test an HTTP
+provider's reachability or authentication.
 
 Usage indexing can lag behind job completion. The daemon retries fresh misses
 and periodically revisits terminal jobs from the past week that still lack a
@@ -2486,8 +2391,12 @@ ignore_review_user_config = true   # Ignore user config for reviews and non-edit
 | `disable_review_skills` | bool | true | Run Codex review jobs with `skills.include_instructions=false` so model-visible skill instructions are stripped from the prompt |
 | `ignore_review_user_config` | bool | true | Pass `--ignore-user-config` to Codex reviews and non-agentic stored-prompt jobs so user-level Codex config is not loaded |
 
-Set either to `false` to restore the prior behavior if you rely on Codex skill
-instructions or user-level Codex config during reviews.
+Set either to `false` if you rely on Codex skill instructions or user-level
+Codex config during local reviews. CI reviews always pass
+`--ignore-user-config`, even with `ignore_review_user_config = false`, so a pull
+request cannot use the user config's trusted projects to load its own
+`.codex/config.toml`. A Codex CLI without the flag fails CI reviews. See
+[Agent configuration in the pull request](/docs/integrations/github/#agent-configuration-in-the-pull-request).
 
 #### Custom Codex Config (Model Providers)
 

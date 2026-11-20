@@ -355,7 +355,10 @@ func TestSuppliedReviewInvocationKeepsAdapterEvidence(t *testing.T) {
 			stored, err := db.GetJobByID(job.ID)
 			require.NoError(t, err)
 			require.Equal(t, storage.JobStatusDone, stored.Status, stored.Error)
-			if tc.name != "muse" {
+			if tc.name == "muse" {
+				assert.NotEmpty(t, stored.SessionID)
+				assert.Contains(t, usageSessions, stored.SessionID)
+			} else {
 				assert.Equal(t, "invocation-session", stored.SessionID)
 				assert.Contains(t, usageSessions, "invocation-session")
 			}

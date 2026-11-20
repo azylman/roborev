@@ -1,12 +1,16 @@
 package agent
 
 import (
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestExtractSessionID(t *testing.T) {
+	initCapture, err := os.ReadFile("testdata/antigravity-init-capture.jsonl")
+	require.NoError(t, err)
 	tests := []struct {
 		name string
 		line string
@@ -28,19 +32,9 @@ func TestExtractSessionID(t *testing.T) {
 			want: "pascal-session-999",
 		},
 		{
-			name: "agy conversation_id",
-			line: `{"event":"init","conversation_id":"agy-conv-123"}`,
-			want: "agy-conv-123",
-		},
-		{
-			name: "camel conversationId",
-			line: `{"event":"init","conversationId":"agy-camel-456"}`,
-			want: "agy-camel-456",
-		},
-		{
-			name: "agy result event with conversation_id",
-			line: `{"event":"result","conversation_id":"agy-res-789","response":"ok"}`,
-			want: "agy-res-789",
+			name: "captured agy init conversation_id",
+			line: string(initCapture),
+			want: "b5f7c102-6dc1-4d94-8296-8ba54ef1d0f4",
 		},
 		{
 			name: "pi session event id",

@@ -1147,6 +1147,90 @@ func TestCIPollerProcessPR_AuthorAndBranchFilters(t *testing.T) {
 	}
 }
 
+func TestCIPollerReadsCollaboratorsOncePerPoll(t *testing.T) {
+	t.Setenv("GH_TOKEN", "test-token")
+	assert := assert.New(t)
+	h := newCIPollerHarness(t, "https://github.com/acme/api.git")
+	h.Cfg.CI.ReviewTypes = []string{"security"}
+	h.Cfg.CI.Agents = []string{"codex"}
+	h.Cfg.CI.ThrottleInterval = "0"
+	h.stubProcessPRGit()
+	repo := testutil.InitTestGitRepo(t, h.RepoPath)
+	baseSHA := repo.HeadSHA()
+	h.Poller.mergeBaseFn = func(_, _, _ string) (string, error) { return baseSHA, nil }
+	h.Poller.listPRDiscussionFn = func(context.Context, string, int) ([]ghpkg.PRDiscussionComment, error) {
+		return []ghpkg.PRDiscussionComment{
+			{Author: "alice", Body: "Alice comment", Source: ghpkg.PRDiscussionSourceIssueComment},
+			{Author: "bob", Body: "Bob comment", Source: ghpkg.PRDiscussionSourceIssueComment},
+		}, nil
+	}
+	requests := 0
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `[]`)
+	}))
+	t.Cleanup(api.Close)
+	h.Poller.githubAPIURL = api.URL + "/api/v3"
+	h.Poller.listTrustedActorsFn = h.Poller.listTrustedActors
+	var prs []ghPR
+	h.Poller.listOpenPRsFn = func(context.Context, string) ([]ghPR, error) { return prs, nil }
+	polls := 0
+	poll := func() (prompts []string) {
+		polls++
+		prs = nil
+		for pr := 1; pr <= 3; pr++ {
+			head := repo.CommitFile(fmt.Sprintf("file-%d-%d", polls, pr), "content", "commit")
+			prs = append(prs, ghPR{Number: pr, HeadRefOid: head, BaseRefName: "main"})
+		}
+		require.NoError(t, h.Poller.pollRepo(t.Context(), "acme/api", h.Cfg))
+		for _, pr := range prs {
+			members := h.panelMembers(t, "acme/api", pr.Number, pr.HeadRefOid)
+			require.Len(t, members, 1)
+			prompts = append(prompts, members[0].Prompt)
+		}
+		return prompts
+	}
+
+	for _, prompt := range poll() {
+		assert.NotContains(prompt, "Alice comment")
+	}
+	assert.Equal(1, requests)
+	assert.NotContains(h.Poller.trustedActors, "acme/api")
+
+	lookups := 0
+	trusted := map[string]struct{}{"alice": {}}
+	h.Poller.listTrustedActorsFn = func(context.Context, string) (map[string]struct{}, error) {
+		lookups++
+		return trusted, nil
+	}
+	for _, prompt := range poll() {
+		assert.Contains(prompt, "Alice comment")
+		assert.NotContains(prompt, "Bob comment")
+	}
+	assert.Equal(1, lookups)
+
+	trusted = map[string]struct{}{"alice": {}, "bob": {}}
+	for _, prompt := range poll() {
+		assert.Contains(prompt, "Bob comment")
+	}
+	assert.Equal(2, lookups)
+
+	lookups = 0
+	h.Poller.listTrustedActorsFn = func(context.Context, string) (map[string]struct{}, error) {
+		lookups++
+		if lookups == 1 {
+			return nil, errors.New("unavailable")
+		}
+		return map[string]struct{}{"alice": {}}, nil
+	}
+	prompts := poll()
+	assert.NotContains(prompts[0], "Alice comment")
+	assert.Contains(prompts[1], "Alice comment")
+	assert.Contains(prompts[2], "Alice comment")
+	assert.Equal(2, lookups)
+}
+
 func TestCIPollerAllowCodeowners(t *testing.T) {
 	assert := assert.New(t)
 	h := newCIPollerHarness(t, "https://github.com/acme/api.git")
@@ -2982,7 +3066,7 @@ func TestLoadCIRepoConfig_LoadsFromDefaultBranch(t *testing.T) {
 	}
 	require.NotNil(t, repoConfig.Config, "expected non-nil config")
 	assert.Equal(t, []string{"claude"}, repoConfig.Config.CI.Agents, "agents")
-	assert.Equal(t, "origin/main", repoConfig.Ref)
+	assert.Equal(t, "refs/remotes/origin/main", repoConfig.Ref)
 }
 
 func TestLoadCIRepoConfig_FallsBackWhenNoConfigOnDefaultBranch(t *testing.T) {
@@ -3041,7 +3125,7 @@ func TestLoadCIRepoConfig_PropagatesParseError(t *testing.T) {
 		}, "expected ConfigParseError, got: %v", err)
 	}
 	assert.Nil(t, repoConfig.Config)
-	assert.Equal(t, "origin/main", repoConfig.Ref)
+	assert.Equal(t, "refs/remotes/origin/main", repoConfig.Ref)
 }
 
 func TestCIPollerProcessPR_SetsPendingCommitStatus(t *testing.T) {
@@ -3566,7 +3650,7 @@ func TestCIPollerProcessPR_ReviewsMapMatrix(t *testing.T) {
 	}
 }
 
-func TestResolveCIMatrixMembersUsesPassedRepoConfigForAgentModel(t *testing.T) {
+func TestResolveCIMatrixMembersUsesPassedRepoConfigForAgentModelAndEvidence(t *testing.T) {
 	h := newCIPollerHarness(t, "git@github.com:acme/api.git")
 	h.Cfg.DefaultAgent = "global-agent"
 	h.Cfg.DefaultModel = "global-model"
@@ -3586,6 +3670,7 @@ func TestResolveCIMatrixMembersUsesPassedRepoConfigForAgentModel(t *testing.T) {
 	repoCfg := &config.RepoConfig{
 		ReviewAgent: "default-branch-agent",
 		ReviewModel: "default-branch-model",
+		Review:      config.ReviewConfig{BinaryEvidence: new(true)},
 		CI: config.RepoCIConfig{
 			Agents:      []string{""},
 			ReviewTypes: []string{"default"},
@@ -3604,6 +3689,7 @@ func TestResolveCIMatrixMembersUsesPassedRepoConfigForAgentModel(t *testing.T) {
 	require.Len(t, members, 1)
 	assert.Equal(t, "default-branch-agent", members[0].Agent)
 	assert.Equal(t, "default-branch-model", members[0].Model)
+	assert.True(t, members[0].BinaryEvidence)
 }
 
 func TestResolveCIMatrixMembersUsesCustomTypeReasoning(t *testing.T) {
@@ -3791,6 +3877,7 @@ func TestCIExperimentModelsOverrideGlobalCIModel(t *testing.T) {
 	h.Cfg.CI.Agents = []string{"codex"}
 	h.Cfg.CI.ReviewTypes = []string{"design"}
 	h.Cfg.ReviewMinSeverity = "high"
+	h.Cfg.ReviewAgent = "test"
 	h.Cfg.DesignAgent = "test"
 	h.Poller.agentResolverFn = func(name string) (string, error) {
 		return name, nil
@@ -4146,6 +4233,28 @@ func TestCIPollerProcessPR_ExperimentValidationFailureSetsConfigurationStatus(t 
 	assert.Contains(t, (*statuses)[0].Desc, "roborev config validate")
 }
 
+func TestCIPollerProcessPR_UndefinedPanelSetsConfigurationStatus(t *testing.T) {
+	h := newCIPollerHarness(t, "git@github.com:acme/api.git")
+	h.Cfg.CI.ReviewTypes = []string{"security"}
+	h.Cfg.CI.Agents = []string{"codex"}
+	h.Poller = NewCIPoller(h.DB, NewStaticConfig(h.Cfg), nil)
+	h.stubProcessPRGit()
+	h.Poller.loadRepoConfigFn = func(string) (ciRepoConfigSource, error) {
+		return ciRepoConfigSource{Config: &config.RepoConfig{CI: config.RepoCIConfig{Panel: "missing"}}}, nil
+	}
+	statuses := h.CaptureCommitStatuses()
+
+	err := h.Poller.processPR(t.Context(), "acme/api", ghPR{
+		Number: 96, HeadRefOid: "head-sha-96", HeadRefName: "feature",
+		BaseRefName: "main",
+	}, h.Cfg)
+
+	require.ErrorContains(t, err, "missing")
+	require.Len(t, *statuses, 1, "without an experiment, an undefined panel is still a configuration error")
+	assert.Equal(t, "error", (*statuses)[0].State)
+	assert.Contains(t, (*statuses)[0].Desc, "roborev config validate")
+}
+
 func TestCIPollerProcessPR_RepoExperimentValidationFailureSetsConfigurationStatus(t *testing.T) {
 	h := newCIPollerHarness(t, "git@github.com:acme/api.git")
 	h.Cfg.CI.ReviewTypes = []string{"security"}
@@ -4275,17 +4384,17 @@ func designMemberCount(members []storage.ReviewJob) int {
 	return n
 }
 
-// TestProcessPRCreatesPanelRun verifies the core cutover: processPR enqueues one
-// panel run per PR. With auto-design enabled and a design-warranting commit, the
-// run carries the matrix member plus exactly one whole-range design member; every
-// member is role=member and not a classify job.
-func TestProcessPRCreatesPanelRun(t *testing.T) {
+// TestProcessPRCreatesPanelRunWithFrozenDesignBinaryEvidence checks that
+// auto-design adds one whole-range design member with frozen binary evidence.
+// Every member has role=member and is not a classify job.
+func TestProcessPRCreatesPanelRunWithFrozenDesignBinaryEvidence(t *testing.T) {
 	assert := assert.New(t)
 	p, db, _, repo, cfg := newCIPanelGitHarness(t)
 	p.loadRepoConfigFn = func(string) (ciRepoConfigSource, error) {
 		enabled := true
 		rc := &config.RepoConfig{}
 		rc.AutoDesignReview.Enabled = &enabled
+		rc.Review.BinaryEvidence = &enabled
 		return ciRepoConfigSource{Config: rc}, nil
 	}
 
@@ -4312,6 +4421,11 @@ func TestProcessPRCreatesPanelRun(t *testing.T) {
 		assert.Equal(storage.PanelRoleMember, m.PanelRole, "member %d role", m.ID)
 		assert.NotEqual(storage.JobTypeClassify, m.JobType, "member %d must not be classify", m.ID)
 		assert.Equal(base+".."+head, m.GitRef, "member %d covers the frozen range", m.ID)
+		if m.ReviewType == config.ReviewTypeDesign {
+			var settings config.ReviewSettings
+			require.NoError(t, json.Unmarshal([]byte(m.PanelMemberConfigJSON), &settings))
+			assert.True(settings.BinaryEvidence, "design member freezes the repository override")
+		}
 	}
 	assert.Equal(1, designMemberCount(members), "exactly one design member")
 }

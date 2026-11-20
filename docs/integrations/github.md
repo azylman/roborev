@@ -21,7 +21,8 @@ The CI poller runs inside the roborev daemon. On each interval it:
     commit. If that commit cannot be fetched, daemon health reports the PR as
     failed and the next poll tries again
 1. Computes the frozen merge-base range (`base..head`) and includes human PR
-    discussion from trusted collaborators in the review prompt
+    discussion from trusted collaborators in the review prompt. Changes to
+    collaborator roles take effect on the next poll
 1. Loads `.roborev.toml` from the repo's default branch, then resolves either
     `[ci] panel` or the compatible CI matrix (`agents`, `review_types`, or
     `[ci.reviews]`)
@@ -445,11 +446,12 @@ The status context is `roborev` and progresses through these states:
 | `failure` | At least one member failed to run for a genuine reason while another member still produced usable review output |
 | `error` | No reviewer produced usable output and no retry remains, or no agent is available |
 
-Skipped PRs, whether from `skip_drafts`, `skip_labels`, or the
-[author and branch filters](#filtering-which-prs-get-reviewed), get a `success`
-commit status that names the skip reason, because commit statuses do not have a
-skipped state. With GitHub App authentication the poller also creates a roborev
-check run that completes with a `skipped` conclusion.
+Skipped PRs, whether from `skip_drafts`, `skip_labels`, the
+[author and branch filters](#filtering-which-prs-get-reviewed), or a change that
+leaves no reviewer anything to review, get a `success` commit status that names
+the skip reason, because commit statuses do not have a skipped state. With
+GitHub App authentication the poller also creates a roborev check run that
+completes with a `skipped` conclusion.
 
 Status checks require **Commit statuses: Read and write**. Skipped checks also
 require **Checks: Read and write**. The setup guide above includes both
@@ -469,6 +471,112 @@ comments are still posted when a reviewer produces usable output.
     Status checks are posted per commit, not per member job. The status reflects
     whether the review infrastructure completed, not whether the reviewer found code
     issues. Findings are reported in the PR comment.
+
+## Review commits on the default branch
+
+A finding can survive a pull request review and still land. Default-branch
+reviews give each landed change its own review, so the issues that reached the
+branch can be followed up, fixed, or deliberately deferred.
+
+Set `review_default_branch = true` in the daemon's global `[ci]` section. On
+each poll, the poller then:
+
+1. Fetches each configured repo and reads its default branch from `origin/HEAD`
+1. Lists the commits that landed on that branch since the previous poll,
+    following first parents only
+1. Reviews each commit against its first parent, with the same panel or matrix
+    and the same default-branch `.roborev.toml` as pull request reviews
+
+A merge commit is reviewed as the whole change it brought to the branch. Squash
+and rebase merges are reviewed one landed commit at a time.
+
+```toml
+[ci]
+enabled = true
+repos = ["myorg/*"]
+review_default_branch = true
+```
+
+A repo can turn these reviews off in its `.roborev.toml`:
+
+```toml
+[ci]
+review_default_branch = false
+```
+
+Expect this behavior:
+
+- **History is not reviewed.** The first poll after you turn the option on
+    records the branch head and reviews nothing. Only commits that land after
+    that poll are reviewed. Turning the option off forgets this position, so
+    turning it back on starts from the head again. The same happens to a repo
+    that leaves the polled repos and later returns.
+- **Commits that land while the daemon is stopped are reviewed.** The position
+    is saved, so the first poll after a restart queues a review for every commit
+    that landed in between.
+- **Opted-out commits are skipped.** A commit whose own `.roborev.toml` sets
+    `review_default_branch = false` is never reviewed, even when a later commit
+    turns reviews back on before the next poll or other settings in that file
+    are invalid. When the branch has no committed `.roborev.toml`, the poller's
+    checkout of the repo decides, as it does for pull request reviews.
+- **Each commit is reviewed once.** The poller records each reviewed commit in
+    its local database. A restart or a repeated poll does not queue it again.
+    Rerunning a default-branch review updates its commit status when the new
+    result arrives. Rerunning an earlier run is refused until the latest run's
+    result is published.
+- **A failed review is not retried.** Pull request reviews retry after a
+    reviewer outage or an exhausted quota. A default-branch review reports the
+    failure once; rerun it to review the commit.
+- **Invalid configuration does not block later commits.** A commit whose review
+    settings fail `roborev config validate`, such as a `[ci] panel` that names
+    no defined panel, gets an `error` status and is not reviewed. Later commits
+    are reviewed once the configuration is fixed.
+- **A commit with nothing to review is skipped.** When no voting reviewer would
+    see a change, for example an empty commit or one that changes only excluded
+    files, the commit gets a `success` status with the description
+    `Review skipped: nothing to review` and no review is stored.
+- **Quiet hours delay the reviews.** Commits that land during
+    [quiet hours](#quiet-hours) are reviewed after quiet hours end.
+- **`batch_timeout` applies.** As with pull requests, a reviewer that runs past
+    `batch_timeout` is canceled once another reviewer has a result.
+- **A rewritten branch restarts from its new head.** When the last reviewed
+    commit is no longer in the branch's first-parent history, for example after
+    a force push, the poller cannot tell new commits from reviewed ones. It
+    reviews nothing and continues with the commits that land next. It does the
+    same when its clone of the repo no longer has the last reviewed commit.
+- **A new default branch starts from its head.** When the repo's default branch
+    is renamed, or another branch becomes the default, the poller follows the
+    new default branch and reviews the commits that land on it next.
+- **Every poll fetches every repo.** With the option on, the poller runs
+    `git fetch` for each configured repo on each interval, even when no pull
+    request changed. It also asks the repo's remote which branch is the default,
+    with `git ls-remote --symref origin HEAD`, and fetches that branch when the
+    checkout's fetch settings leave it out, as in a single-branch clone. When
+    the full fetch fails but the default branch can still be fetched, for
+    example because the clone only fetches a deleted branch, default-branch
+    reviews continue.
+- **No PR comment is posted.** The review is stored like any other review. Run
+    `roborev list` or `roborev show <job-id>` to read it, or use a
+    [review hook](/docs/guides/hooks/) to send results elsewhere.
+
+With GitHub credentials, the poller also posts a commit status with the context
+`roborev/default-branch` on each reviewed commit. This context is separate from
+the pull request's `roborev` status, which can be on the same commit after a
+fast-forward merge. It is informational: as with the pull request status, its
+state reports whether the review ran, and its description reports the result.
+
+A status that GitHub does not accept right away is sent again on the next poll.
+The poller stops trying when GitHub will never accept it: the daemon has no
+GitHub credentials, the token cannot write commit statuses, or GitHub no longer
+has the commit. When the GitHub App token request fails, the status is retried,
+even if the fallback token was refused. The review itself is still stored.
+
+| State | Description | When |
+|-------|-------------|------|
+| `pending` | Review in progress | The review is queued or running |
+| `success` | No issues found | The review ran and found no issues at or above `min_severity` |
+| `success` | Issues found | The review ran and found issues at or above `min_severity` |
+| `failure` or `error` | Varies | A reviewer failed, the review was canceled, or the repo's `.roborev.toml` is invalid |
 
 ## Keeping the Daemon Running
 
@@ -502,11 +610,15 @@ Patterns use Go's `path.Match` syntax (`*` matches any sequence of characters,
 `?` matches a single character, `[...]` matches character classes). Matching is
 case-insensitive.
 
-Wildcard expansion calls the GitHub API and caches results for one hour.
-Archived repos and repos with pull requests explicitly disabled are excluded.
-Repos remain eligible when the API omits the pull-request setting. If you enable
-pull requests later, the next discovery refresh includes the repo again.
-Explicit (non-wildcard) repos always take priority when `max_repos` is reached.
+Wildcard expansion calls the GitHub API and caches results for one hour. For an
+organization, it lists every repository the token can reach. For a personal
+account, it lists the public repositories plus the private ones the token can
+reach: with a GitHub App, the repositories the app is installed on; with a user
+token, those the user owns or collaborates on. Archived repos and repos with
+pull requests explicitly disabled are excluded. Repos remain eligible when the
+API omits the pull-request setting. If you enable pull requests later, the next
+discovery refresh includes the repo again. Explicit (non-wildcard) repos always
+take priority when `max_repos` is reached.
 
 Failed repository lookups retry on the first poll after 15 minutes, then after
 30 minutes, and then hourly. Other lookups keep their hourly cache, and the
@@ -754,33 +866,46 @@ nothing survives the display filters. Defaults preserve existing behavior:
 [ci]
 comment_max_findings = 0   # Unlimited structured findings
 comment_when_clean = true # Create comments even when no findings survive
+# comment_min_confidence = 0.8 # Optional; unset disables confidence filtering
 ```
 
 Set `comment_max_findings` to a positive integer to show that many structured
-findings after severity filtering. Comments show critical findings first, then
-high, medium, and low, preserving the original order within each severity. An
-overflow line counts only findings omitted by the cap and points to
-`roborev show --job <synthesis-job-id>` for the complete review. Negative caps
-are invalid, including when loading, saving, or reloading global configuration.
-The omission count and retrieval command remain visible when a long finding
-requires comment truncation. Prose is not capped because it cannot be ranked
-reliably.
+findings after severity and confidence filtering. Comments show critical
+findings first, then high, medium, and low, preserving the stored order within
+each severity. An overflow line counts only findings omitted by the cap and
+points to `roborev show --job <synthesis-job-id>` for the complete review.
+Negative caps are invalid, including when loading, saving, or reloading global
+configuration. The omission count and retrieval command remain visible when a
+long finding requires comment truncation. Prose is not capped because it cannot
+be ranked reliably.
+
+Set `comment_min_confidence` to a finite number from `0` to `1` to hide
+structured findings whose recorded synthesis confidence falls below that floor.
+Findings at the floor and findings with no stored score remain visible. An
+explicit score of zero is compared normally. Synthesis is instructed to use
+`0.5` when no source scored a finding, so a floor above `0.5` can hide it. An
+unset global floor disables filtering. Invalid floors are rejected when loading,
+saving, or reloading configuration. If confidence removes a finding that passed
+the severity filter and no findings remain, the comment says "No findings match
+the comment filters." Confidence does not filter prose.
 
 Set `comment_when_clean = false` to avoid creating a comment when structured
-synthesis has no findings after filtering. Severity-parsed prose is also silent
-when no labelled findings or unlabelled blocks survive. Verbatim prose and
-legacy Markdown remain publishable, even if their text says the review is clean.
-Roborev does not infer cleanliness from text or the stored verdict. With
-`upsert_comments = true`, silent reviews update an existing marker comment to
-the no-findings line. Missing or deleted comments are successful no-ops; cleanup
-never creates a replacement. Permission and transient delivery errors keep the
-normal error and retry behavior.
+synthesis has no findings after filtering, even if the stored review has
+findings. Severity-parsed prose is also silent when no labelled findings or
+unlabelled blocks survive. Verbatim prose and legacy Markdown remain
+publishable, even if their text says the review is clean. Roborev does not infer
+cleanliness from text or the stored verdict. With `upsert_comments = true`,
+silent reviews update an existing marker comment to the no-findings line.
+Missing or deleted comments are successful no-ops; cleanup never creates a
+replacement. Permission and transient delivery errors keep the normal error and
+retry behavior.
 
-Both settings accept per-repo `[ci]` overrides in `.roborev.toml`. An explicit
-repo cap of `0` restores unlimited findings; an explicit `true` restores clean
-comments. These settings apply only to synthesized GitHub daemon comments. Raw
-member fallback diagnostics, daemon-free `roborev ci`, and GitLab keep existing
-behavior. Complete stored reviews, verdicts, prompts, and execution statuses are
+All three settings accept per-repo `[ci]` overrides in `.roborev.toml`. An
+explicit repo cap of `0` restores unlimited findings; a confidence floor of `0`
+disables a global floor; an explicit `true` restores clean comments. These
+settings apply only to synthesized GitHub daemon comments. Raw member fallback
+diagnostics, daemon-free `roborev ci`, and GitLab keep existing behavior.
+Complete stored reviews, verdicts, prompts, and execution statuses are
 unchanged. Unlike these display settings, `ci.min_severity` also controls the
 synthesis verdict.
 
@@ -806,7 +931,10 @@ roborev embeds an invisible HTML marker in its PR comments to identify them.
 When upserting, it searches for the marker, patches the matching comment via the
 GitHub API, and falls back to creating a new comment if the existing one can't
 be updated (e.g., token mismatch between the original poster and the current
-auth).
+auth). The daemon remembers the comment for one run and edits it without listing
+the comments. It scans after a restart or when GitHub reports the remembered
+comment is missing or cannot be edited. While it remains editable, the daemon
+leaves any newer marked comment from another process untouched.
 
 Per-repo overrides in `.roborev.toml` can enable or disable upsert independently
 of the global setting:
@@ -910,9 +1038,16 @@ that start TCP loopback servers cannot run in this sandbox; the checker keeps
 findings it cannot try.
 
 A finding drops only when one verdict supplies evidence and a reason to drop it.
-Missing or duplicate verdicts keep the finding. The job log records the
-verdicts. If every finding drops, the stored review says "No issues found." A
-checker failure or timeout posts the original review unchanged.
+Missing or duplicate verdicts keep the finding. If every finding drops, the
+stored review says "No issues found." A checker failure or timeout posts the
+original review unchanged.
+
+The stored review document records the check in its `check` member: whether the
+checker completed or failed, and for every finding it received, whether the
+finding was kept or dropped, with the checker's evidence and reason. Sync,
+`roborev export reviews`, and the API carry this record; the posted PR comment
+does not. See the [review document format](/docs/commands/#exporting-reviews).
+The job log also records each verdict.
 
 ## Rewriting checked findings
 
@@ -1066,12 +1201,14 @@ set, it takes priority over the matrix fields for that repo.
 | `reviews` | table | global `reviews` | Granular agent-to-review-type map (overrides `agents` and `review_types`; empty table disables reviews) |
 | `reasoning` | string | `"thorough"` | Legacy or exact reasoning level; see [Reasoning Levels](/docs/configuration/#reasoning-levels) |
 | `min_severity` | string | `"low"` | Lowest severity that fails the review: `low`, `medium`, `high`, or `critical`. Lower findings remain in stored reviews but are hidden in PR comments |
+| `comment_min_confidence` | float | global `comment_min_confidence` | Minimum recorded synthesis confidence in GitHub daemon comments. Finite `0`–`1`. Zero disables filtering. |
 | `comment_max_findings` | int | global `comment_max_findings` | Maximum structured findings in synthesized GitHub daemon comments; `0` restores unlimited |
 | `comment_when_clean` | bool | global `comment_when_clean` | Create synthesized GitHub daemon comments when no findings survive display filters |
 | `upsert_comments` | bool | global `upsert_comments` | Override global comment upsert setting for this repo |
 | `include_costs` | bool | global `include_costs` | Include token cost estimates in PR comment footers for this repo |
 | `check` | bool | global `check` | Try synthesized findings before posting and keep those that hold up |
 | `rewrite` | bool | global `rewrite` | Rewrite checked findings in plain words; requires `check` |
+| `review_default_branch` | bool | `true` when on globally | Set `false` to skip default-branch reviews for this repo. It cannot turn them on when the global option is off. |
 
 ## CI Options Reference
 
@@ -1085,6 +1222,7 @@ set, it takes priority over the matrix fields for that repo.
 | `exclude_repos` | array | `[]` | Glob patterns to exclude from the resolved repo list |
 | `skip_labels` | array | `[]` | GitHub PR labels that skip CI reviews (case-insensitive) |
 | `skip_drafts` | bool | `false` | Skip draft PRs; global only. Ready PRs become eligible next poll under the normal gates. |
+| `review_default_branch` | bool | `false` | Also review each commit that lands on each repo's default branch. See [Review commits on the default branch](#review-commits-on-the-default-branch). |
 | `allowed_authors` | array | `[]` | GitHub logins whose PRs are reviewed (case-insensitive). See [Author filter](#author-filter). |
 | `allowed_author_associations` | array | `[]` | PR author associations that are reviewed, such as `OWNER`, `MEMBER`, `COLLABORATOR`. With `allowed_authors` also empty and `allow_codeowners` off, every author is reviewed. |
 | `allow_codeowners` | bool | `false` | Also review PRs from users the base branch's `CODEOWNERS` file names, directly or through a team. See [CODEOWNERS](#codeowners). |
@@ -1106,6 +1244,7 @@ set, it takes priority over the matrix fields for that repo.
 | `rewrite` | bool | `false` | Rewrite checked findings in plain words; requires `check` |
 | `check_model` | string | | Model override for the checker. Global only |
 | `check_reasoning` | string | `"standard"` | Reasoning level for the checker. Global only |
+| `comment_min_confidence` | float | unset | Minimum recorded synthesis confidence in GitHub daemon comments. Finite `0`–`1`. Unset disables filtering. |
 | `comment_max_findings` | int | `0` | Maximum structured findings in synthesized GitHub daemon comments; `0` is unlimited |
 | `comment_when_clean` | bool | `true` | Create synthesized GitHub daemon comments when no findings survive display filters |
 | `upsert_comments` | bool | `false` | Update existing PR comments instead of creating new ones |
@@ -1527,6 +1666,48 @@ These controls remove inherited Git capabilities; they are not filesystem
 isolation. The existing agent read-only tool permissions still apply. Regenerate
 existing workflows with `roborev init gh-action --force` to disable persisted
 checkout credentials and include Copilot's separate secret when selected.
+
+### Agent configuration in the pull request
+
+CI reviews run the agent inside a checkout of the pull request. This applies to
+`roborev ci review`, GitLab pipelines, and the daemon CI poller, which reviews
+each pull request head in a detached worktree. The pull request author controls
+that checkout. Several agent CLIs load configuration from their working
+directory that runs commands: hooks, MCP servers, and plugins. A hook is not a
+tool call, so read-only tool limits do not stop it.
+
+roborev tells each agent to skip the checkout's own configuration. User-level
+configuration, credentials, and context files such as `CLAUDE.md` still load.
+Local reviews of your own commits are unchanged.
+
+| Agent | What a CI review does |
+| --- | --- |
+| Claude Code | Passes `--setting-sources user --strict-mcp-config`, so `.claude/settings.json` hooks and `.mcp.json` servers are skipped. |
+| Codex | Always passes `--ignore-user-config`, which drops the user config's project trust list, so `.codex/config.toml` is skipped. Codex without that flag fails the review. |
+| Gemini | Sets `GEMINI_CLI_TRUST_WORKSPACE=false`. With folder trust off in your Gemini user settings, Gemini skips the checkout's settings; with it on, headless Gemini exits instead of reviewing. |
+| Pi | Passes `--no-approve`, and `--session-dir` set to Pi's default session directory so the checkout cannot choose where sessions are saved. Pi without `--no-approve` fails the review. |
+| Cursor | Starts with an empty `CURSOR_DATA_DIR`, so saved workspace trust does not apply and Cursor refuses the untrusted checkout. |
+| Grok | Sets `GROK_FOLDER_TRUST=1`, so folder trust stays on. A folder you trusted before is still trusted. |
+| Copilot | Removes `COPILOT_ALLOW_ALL` and the `GITHUB_COPILOT_PROMPT_MODE_*` variables. Prompt mode then skips repository hooks and workspace MCP servers. A folder you trusted before is still trusted. |
+| Kilo | Sets `KILO_DISABLE_PROJECT_CONFIG=1`, which skips project config, plugins, and MCP servers. |
+| Muse | Already runs non-agentic reviews in a private home without trusted workspaces. |
+
+Some agents have no way to skip project configuration. Do not use them to review
+pull requests from authors you do not trust:
+
+- **OpenCode** gets `OPENCODE_DISABLE_PROJECT_CONFIG=1`, which skips project MCP
+    servers and custom tools. OpenCode still imports plugins from
+    `.opencode/plugins/` and `opencode.json`.
+- **Droid** loads hooks and MCP servers from `.factory/`.
+- **Kiro** loads hooks and MCP servers from `.kiro/`. `roborev ci review`
+    already refuses Kiro.
+- **Antigravity** loads hooks and plugins from `.agents/`.
+- **ACP agents** load whatever the wrapped CLI loads. `claude-agent-acp` loads
+    project settings and hooks.
+
+These settings narrow what an agent reads from the checkout. They are not a
+sandbox. An agent running with `allow_unsafe_agents` can still run shell
+commands that the reviewed code asks for.
 
 ### Customizing via `.roborev.toml`
 

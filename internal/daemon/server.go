@@ -552,6 +552,9 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 	}
 	s.agentHealth.start(cfg)
+	if cost := costSourceHealth(cfg); !cost.Healthy {
+		log.Printf("Warning: %s", cost.Message)
+	}
 
 	// Repair stale roborev-managed hooks in registered repos (skip in CI
 	// mode where repos are fetch-only and don't need local hooks).
@@ -605,11 +608,17 @@ func (s *Server) stopPanelSweep() {
 	}
 }
 
+// waitForServerReady probes the new listener until it answers. timeout bounds
+// failures that show the server is not serving, such as a refused connection
+// or a rejected handshake. A probe that times out shows the server is serving
+// but slow, as on a host with far more runnable work than CPUs, so startup
+// keeps waiting and gives the next probe twice as long.
 func waitForServerReady(ctx context.Context, ep DaemonEndpoint, timeout time.Duration, serveErrCh <-chan error, startup config.ClientAuth) (bool, bool, error) {
 	deadline := time.Now().Add(timeout)
+	probeTimeout := 200 * time.Millisecond
 	var lastErr error
 
-	for time.Now().Before(deadline) {
+	for lastErr == nil || isTimeoutError(lastErr) || time.Now().Before(deadline) {
 		if ctx.Err() != nil {
 			return false, false, nil
 		}
@@ -624,11 +633,15 @@ func waitForServerReady(ctx context.Context, ep DaemonEndpoint, timeout time.Dur
 			return false, true, err
 		default:
 		}
-		client := ep.readinessHTTPClient(200*time.Millisecond, startup)
-		if _, err := probeDaemonHTTP(ctx, ep, 200*time.Millisecond, client); err == nil {
+		client := ep.readinessHTTPClient(probeTimeout, startup)
+		_, err := probeDaemonHTTP(ctx, ep, probeTimeout, client)
+		if err == nil {
 			return true, false, nil
-		} else {
-			lastErr = err
+		}
+		lastErr = err
+		if isTimeoutError(err) {
+			probeTimeout *= 2
+			continue
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
@@ -651,6 +664,14 @@ func waitForServerReady(ctx context.Context, ep DaemonEndpoint, timeout time.Dur
 		lastErr = fmt.Errorf("server did not respond before timeout")
 	}
 	return false, false, fmt.Errorf("daemon failed to become ready on %s within %s: %w", ep, timeout, lastErr)
+}
+
+// isTimeoutError reports whether err is a request that ran out of time.
+func isTimeoutError(err error) bool {
+	if netErr, ok := errors.AsType[net.Error](err); ok && netErr.Timeout() {
+		return true
+	}
+	return errors.Is(err, context.DeadlineExceeded)
 }
 
 func awaitServeExitOnUnreadyStartup(serveExited bool, serveErrCh <-chan error) error {
@@ -968,7 +989,7 @@ func (s *Server) runSetupFinishedTelemetry(ctx context.Context) {
 			return
 		case <-s.setupFinishedWake:
 		}
-		_, err := backoff.Retry(ctx, func() (struct{}, error) {
+		_, _ = backoff.Retry(ctx, func() (struct{}, error) {
 			if s.setupFinishedClaimed.Load() {
 				return struct{}{}, nil
 			}
@@ -983,15 +1004,10 @@ func (s *Server) runSetupFinishedTelemetry(ctx context.Context) {
 				s.setupFinishedClaimed.Store(true)
 			}
 			if claim == storage.SetupFinishedNewClaim {
-				if err := s.telemetry.Capture(telemetry.EventSetupFinished, nil); err != nil {
-					log.Printf("Warning: capture setup finished telemetry: %v", err)
-				}
+				_ = s.telemetry.Capture(telemetry.EventSetupFinished, nil)
 			}
 			return struct{}{}, nil
 		}, backoff.WithMaxElapsedTime(0))
-		if err != nil && ctx.Err() == nil {
-			log.Printf("Warning: claim setup finished telemetry: %v", err)
-		}
 	}
 }
 
@@ -1035,22 +1051,16 @@ func (s *Server) captureTelemetryEvent(ctx context.Context, event string, cfg *c
 	}
 
 	props := s.telemetryProperties(ctx, cfg)
-	if err := s.telemetry.Capture(event, props); err != nil {
-		log.Printf("Warning: capture telemetry event: %v", err)
-	}
+	_ = s.telemetry.Capture(event, props)
 }
 
 func (s *Server) telemetryProperties(ctx context.Context, cfg *config.Config) map[string]any {
 	repoCount := 0
-	if repos, err := s.db.ListRepos(); err != nil {
-		log.Printf("Warning: failed to count repos for telemetry: %v", err)
-	} else {
+	if repos, err := s.db.ListRepos(); err == nil {
 		repoCount = len(repos)
 	}
 	reviewCount := 0
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM reviews`).Scan(&reviewCount); err != nil {
-		log.Printf("Warning: failed to count reviews for telemetry: %v", err)
-	}
+	_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM reviews`).Scan(&reviewCount)
 
 	props := map[string]any{
 		"repo_count":   telemetry.CountBucket(repoCount),
@@ -1073,12 +1083,10 @@ func (s *Server) SetSyncWorker(sw *storage.SyncWorker) {
 		if s.telemetry == nil || !s.telemetry.Enabled() {
 			return
 		}
-		if err := s.telemetry.Capture(telemetry.EventSyncFailed, map[string]any{
+		_ = s.telemetry.Capture(telemetry.EventSyncFailed, map[string]any{
 			telemetry.PropertySyncSource: telemetry.SyncSourcePostgres,
 			telemetry.PropertyReason:     reason,
-		}); err != nil {
-			log.Printf("Warning: capture sync failed telemetry: %v", err)
-		}
+		})
 	})
 	sw.SetAfterPull(s.captureSetupFinishedTelemetry)
 }
@@ -1325,24 +1333,29 @@ func findCompatibleReusableSession(
 	globalCfg *config.Config,
 	experiment *storage.ExperimentAssignmentInput,
 	ciPRNumber int,
-) (string, *uuid.UUID) {
+) (string, string, *uuid.UUID) {
 	// A resumed agent session may retain the caller's cwd. Isolated committed
 	// reviews always start fresh; dirty and CI session policies are unchanged.
 	committedReview := opts.JobType == "" || opts.JobType == storage.JobTypeReview || opts.JobType == storage.JobTypeRange
 	if committedReview && opts.Source != storage.JobSourceCI && opts.CIBaseBranch == "" &&
 		opts.GitRef != "dirty" && opts.DiffContent == "" &&
 		config.ResolveIsolateReviewsFromConfig(repoCfg, globalCfg) {
-		return "", nil
+		return "", "", nil
 	}
 	if !config.ResolveReuseReviewSessionFromConfig(repoCfg, globalCfg) ||
 		opts.Branch == "" || targetSHA == "" ||
 		opts.PanelRole == storage.PanelRoleSynthesis ||
 		!agent.SupportsSessionResume(opts.Agent) {
-		return "", nil
+		return "", "", nil
 	}
+	resolvedAgent, err := agent.GetPreferredOrBackupWithConfigFromConfig(repoCfg, opts.Agent, globalCfg)
+	if err != nil {
+		return "", "", nil
+	}
+	wantedSessionCLI := sessionCLIForAgent(resolvedAgent)
 	machineID, err := db.GetMachineID()
 	if err != nil || machineID == uuid.Nil() {
-		return "", nil
+		return "", "", nil
 	}
 	candidates, err := db.FindCompatibleReusableSessionCandidates(storage.ReusableSessionQuery{
 		RepoID:                opts.RepoID,
@@ -1358,6 +1371,7 @@ func findCompatibleReusableSession(
 		PanelMemberName:       opts.PanelMemberName,
 		PanelMemberConfigJSON: opts.PanelMemberConfigJSON,
 		SourceMachineID:       machineID,
+		SessionCLI:            wantedSessionCLI,
 		CIPRNumber:            ciPRNumber,
 		Experiment:            experiment,
 		Limit: config.ResolveReuseReviewSessionLookbackFromConfig(
@@ -1366,7 +1380,7 @@ func findCompatibleReusableSession(
 	})
 	if err != nil {
 		log.Printf("enqueue: lookup compatible reusable session failed for repo=%d agent=%q: %v", opts.RepoID, opts.Agent, err)
-		return "", nil
+		return "", "", nil
 	}
 	const maxSessionReuseDistance = 50
 	for _, candidate := range candidates {
@@ -1382,9 +1396,9 @@ func findCompatibleReusableSession(
 		if err != nil || len(commitsSinceCandidate) > maxSessionReuseDistance {
 			continue
 		}
-		return candidate.SessionID, candidate.UUID
+		return candidate.SessionID, candidate.SessionCLI, candidate.UUID
 	}
-	return "", nil
+	return "", "", nil
 }
 
 func reusableSessionTarget(gitRef string) string {
@@ -3338,6 +3352,7 @@ type resolvedSingleAgent struct {
 	Model       string
 	BackupAgent string
 	BackupModel string
+	Settings    config.ReviewSettings
 }
 
 // resolveSingleAgent resolves the single-review agent for the no-panel path:
@@ -3395,12 +3410,12 @@ func (s *Server) resolveSingleAgent(
 	}
 	agentName = resolved.Name()
 	target := storage.ReviewJob{JobType: storage.JobTypeForEnqueue(in.descriptor.baseOpts()), ReviewType: in.req.ReviewType}
-	tools, err := currentReviewTools(target, in.repoCfg, in.cfg)
+	settings, err := currentReviewSettings(target, in.repoCfg, in.cfg)
 	if err == nil {
-		err = agent.ValidateReviewToolSelection(tools, resolved, in.req.Agentic)
+		err = agent.ValidateReviewToolSelection(settings.Tools, resolved, in.req.Agentic)
 	}
 	if err == nil {
-		err = agent.ValidateReviewToolBackup(tools, resolution, agentName)
+		err = agent.ValidateReviewToolBackup(settings.Tools, resolution, agentName)
 	}
 	if err != nil {
 		out, _ := rawJSONOutput(http.StatusBadRequest, ErrorResponse{Error: err.Error()})
@@ -3423,6 +3438,7 @@ func (s *Server) resolveSingleAgent(
 		Model:       resolution.ModelForSelectedAgent(agentName, in.requestedModel),
 		BackupAgent: backupAgent,
 		BackupModel: backupModel,
+		Settings:    settings,
 	}, nil
 }
 
@@ -3454,6 +3470,15 @@ func (s *Server) enqueueSingleAgent(
 	if in.experiment != nil {
 		o.BackupAgent = execution.BackupAgent
 		o.BackupModel = execution.BackupModel
+		// Freeze the selected arm's review policy alongside its execution plan.
+		target := storage.ReviewJob{JobType: storage.JobTypeForEnqueue(o), ReviewType: o.ReviewType}
+		if target.IsReviewJob() && !target.IsGoalReviewJob() {
+			snapshot, snapshotErr := json.Marshal(execution.Settings)
+			if snapshotErr != nil {
+				return rawJSONOutput(http.StatusInternalServerError, ErrorResponse{Error: snapshotErr.Error()})
+			}
+			o.PanelMemberConfigJSON = string(snapshot)
+		}
 		plan, planErr := experimentPlanForJob(o)
 		if planErr != nil {
 			return rawJSONOutput(http.StatusInternalServerError, ErrorResponse{Error: planErr.Error()})
@@ -3468,7 +3493,7 @@ func (s *Server) enqueueSingleAgent(
 		o.Experiment = assignment
 	}
 	if in.req.ReviewSettings == nil {
-		o.SessionID, o.ResumeSourceJobUUID = findCompatibleReusableSession(
+		o.SessionID, o.SessionCLI, o.ResumeSourceJobUUID = findCompatibleReusableSession(
 			ctx, s.db, in.checkoutRoot, in.descriptor.sessionSHA, o,
 			in.repoCfg, in.rawRepoCfg, in.cfg, o.Experiment, 0,
 		)
@@ -3478,7 +3503,7 @@ func (s *Server) enqueueSingleAgent(
 	var duplicate bool
 	var err error
 	if in.req.Source == storage.JobSourcePostCommit {
-		job, duplicate, err = s.db.EnqueuePostCommitJob(o)
+		job, duplicate, err = s.db.EnqueuePostCommitJob(ctx, o)
 	} else {
 		job, err = s.db.EnqueueJob(o)
 	}
@@ -4096,7 +4121,8 @@ func (s *Server) humaGetHealth(
 		Message: workersMessage,
 	})
 
-	agents := s.agentHealth.observe(s.configWatcher.Config())
+	cfg := s.configWatcher.Config()
+	agents := s.agentHealth.observe(cfg)
 	if !agents.Healthy {
 		allHealthy = false
 	}
@@ -4127,6 +4153,13 @@ func (s *Server) humaGetHealth(
 		}
 		components = append(components, ci)
 	}
+	// Missing accounting data degrades health without blocking review work
+	// or hiding the CI recovery that explains an outstanding review failure.
+	cost := costSourceHealth(cfg)
+	if !cost.Healthy {
+		allHealthy = false
+	}
+	components = append(components, cost)
 
 	var recentErrors []storage.ErrorEntry
 	var errorCount24h int
@@ -4231,6 +4264,56 @@ func (s *Server) humaShutdown(
 	resp := &ShutdownOutput{}
 	resp.Body.Status = "shutting down"
 	return resp, nil
+}
+
+// ErrUpdateDrainActive is returned by InterruptShutdown while an update drain
+// waits for running jobs.
+var ErrUpdateDrainActive = errors.New("an update drain is active")
+
+// humaInterruptShutdown is the API form of InterruptShutdown.
+func (s *Server) humaInterruptShutdown(
+	ctx context.Context, input *struct{},
+) (*ShutdownOutput, error) {
+	if err := s.InterruptShutdown(ctx); err != nil {
+		if errors.Is(err, ErrUpdateDrainActive) {
+			return nil, huma.Error409Conflict(err.Error())
+		}
+		return nil, huma.Error500InternalServerError(err.Error())
+	}
+	resp := &ShutdownOutput{}
+	resp.Body.Status = "shutting down"
+	return resp, nil
+}
+
+// InterruptShutdown shuts down without waiting for running jobs. Running
+// attempts return to the queue without consuming a retry, through the same
+// worker path that an interrupting update uses.
+func (s *Server) InterruptShutdown(ctx context.Context) error {
+	s.shutdownDrainMu.Lock()
+	defer s.shutdownDrainMu.Unlock()
+	if s.updateDrain != nil {
+		return ErrUpdateDrainActive
+	}
+	// Hold attempt transitions across the claim gate and the running-job
+	// snapshot so no job can start between them without being interrupted.
+	s.workerPool.attemptTransitionsMu.Lock()
+	defer s.workerPool.attemptTransitionsMu.Unlock()
+	if err := s.db.SetShutdownDrainingContext(ctx, true); err != nil {
+		return fmt.Errorf("block job claims for shutdown: %w", err)
+	}
+	ids, err := s.db.ListRunningJobIDs()
+	if err != nil {
+		if !s.shutdownDraining {
+			// Reopen claims that this request closed; the daemon keeps running.
+			err = errors.Join(err, s.db.SetShutdownDrainingContext(context.WithoutCancel(ctx), false))
+		}
+		return fmt.Errorf("list running jobs: %w", err)
+	}
+	s.workerPool.interruptJobsForUpdateLocked(ids)
+	s.shutdownDraining = true
+	s.workerPool.BeginStop()
+	s.RequestShutdown()
+	return nil
 }
 
 func (s *Server) beginShutdownDrain() error {

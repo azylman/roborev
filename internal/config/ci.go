@@ -5,6 +5,7 @@ package config
 import (
 	"fmt"
 	"maps"
+	"math"
 	"os"
 	"path"
 	"slices"
@@ -130,6 +131,10 @@ type CIConfig struct {
 	// SkipDrafts prevents CI reviews of draft pull requests. Default: false.
 	SkipDrafts bool `toml:"skip_drafts"`
 
+	// ReviewDefaultBranch also reviews each commit that lands on a polled
+	// repository's default branch. Default: false.
+	ReviewDefaultBranch bool `toml:"review_default_branch"`
+
 	// AllowedAuthors and AllowedAuthorAssociations limit CI reviews to PRs
 	// from trusted authors. When either is set, a PR is reviewed only if its
 	// author's login is in AllowedAuthors (case-insensitive) or its GitHub
@@ -199,6 +204,10 @@ type CIConfig struct {
 	// MinSeverity filters out findings below this severity level during synthesis.
 	// Valid values: critical, high, medium, low. Empty means no filter (include all).
 	MinSeverity string `toml:"min_severity"`
+
+	// CommentMinConfidence filters stated confidence in synthesized GitHub daemon comments.
+	// Nil disables the filter; zero includes every confidence.
+	CommentMinConfidence *float64 `toml:"comment_min_confidence"`
 
 	// CommentMaxFindings caps structured findings in synthesized GitHub daemon
 	// comments. Zero (the default) is unlimited. Stored reviews remain complete.
@@ -571,6 +580,9 @@ type RepoCIConfig struct {
 	Check   *bool `toml:"check" comment:"Check CI findings before posting."`
 	Rewrite *bool `toml:"rewrite" comment:"Rewrite checked CI findings in plain words."`
 
+	// ReviewDefaultBranch can turn off default-branch commit reviews for this repo.
+	ReviewDefaultBranch *bool `toml:"review_default_branch" comment:"Set false to skip CI reviews of commits landing on this repo's default branch."`
+
 	// Agents overrides the list of agents for CI reviews of this repo.
 	Agents []string `toml:"agents" comment:"Override the agents used by CI for this repo."`
 
@@ -590,6 +602,9 @@ type RepoCIConfig struct {
 
 	// MinSeverity overrides the minimum severity filter for CI synthesis.
 	MinSeverity string `toml:"min_severity" comment:"Override the minimum CI severity included in synthesized output."`
+
+	// CommentMinConfidence overrides the global floor; zero disables it.
+	CommentMinConfidence *float64 `toml:"comment_min_confidence" comment:"Minimum recorded synthesis confidence in GitHub daemon comments (0..1). Unset inherits the global floor. Zero disables filtering."`
 
 	// CommentMaxFindings overrides the global cap; an explicit zero disables it.
 	CommentMaxFindings *int `toml:"comment_max_findings" comment:"Maximum structured findings in synthesized GitHub daemon comments; zero is unlimited."`
@@ -877,6 +892,19 @@ func ResolveCICheck(repoCfg *RepoConfig, globalCfg *Config) bool {
 	return resolveBool(false, repoVal, globalVal)
 }
 
+// ResolveCIReviewDefaultBranch reports whether the CI poller reviews commits
+// that land on the repository's default branch. The global switch enables the
+// feature; a repository can only turn it off.
+func ResolveCIReviewDefaultBranch(repoCfg *RepoConfig, globalCfg *Config) bool {
+	if globalCfg == nil || !globalCfg.CI.ReviewDefaultBranch {
+		return false
+	}
+	if repoCfg != nil && repoCfg.CI.ReviewDefaultBranch != nil {
+		return *repoCfg.CI.ReviewDefaultBranch
+	}
+	return true
+}
+
 // ResolveCIRewrite lets the repository override the global rewrite switch.
 func ResolveCIRewrite(repoCfg *RepoConfig, globalCfg *Config) bool {
 	var repoVal, globalVal *bool
@@ -918,6 +946,24 @@ func ResolveCICommentWhenClean(repoCfg *RepoConfig, globalCfg *Config) bool {
 func validateCICommentMaxFindings(value int) error {
 	if value < 0 {
 		return fmt.Errorf("ci.comment_max_findings must be non-negative")
+	}
+	return nil
+}
+
+// ResolveCICommentMinConfidence resolves the publication floor; repo zero resets it.
+func ResolveCICommentMinConfidence(repoCfg *RepoConfig, globalCfg *Config) float64 {
+	if repoCfg != nil && repoCfg.CI.CommentMinConfidence != nil {
+		return *repoCfg.CI.CommentMinConfidence
+	}
+	if globalCfg != nil && globalCfg.CI.CommentMinConfidence != nil {
+		return *globalCfg.CI.CommentMinConfidence
+	}
+	return 0
+}
+
+func validateCICommentMinConfidence(value *float64) error {
+	if value != nil && (math.IsNaN(*value) || *value < 0 || *value > 1) {
+		return fmt.Errorf("ci.comment_min_confidence must be finite and between 0 and 1")
 	}
 	return nil
 }

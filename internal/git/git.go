@@ -45,6 +45,37 @@ import (
 // command-scope config would only add a redundant subprocess.
 var gitRunner = gitcmd.Runner{StripEnv: true, DisableSafeDirectoryForward: true}
 
+// UserConfigRunner returns the git runner for setting up a temporary checkout
+// of the user's own repository, such as refine's worktree or an isolated
+// review checkout, including its submodules and Git LFS files.
+//
+// Like gitRunner, it strips inherited GIT_* variables but leaves the user's
+// global and system git config readable. Submodule clones and LFS pulls resolve
+// credential helpers, url.insteadOf rewrites, and proxy settings from that
+// config, so hiding it (the gitcmd.New default) makes a private HTTPS
+// submodule unclonable while terminal prompts are disabled.
+//
+// Hooks stay disabled for every command, including submodule checkouts, where
+// a relative core.hooksPath could run tracked scripts. core.askPass is cleared
+// and TerminalPrompt stays false, so nothing can wait for input.
+//
+// Checkouts of code the user did not write, such as CI checkouts of pull
+// request heads, keep gitcmd.New's isolated config instead.
+//
+// Env must be non-nil: gitworktree.Create replaces a runner whose Env is nil
+// with gitcmd.New().
+func UserConfigRunner() gitcmd.Runner {
+	return gitcmd.Runner{
+		Env:      os.Environ(),
+		StripEnv: true,
+		Config: []gitcmd.Config{
+			{Key: "core.askPass", Value: ""},
+			{Key: "core.hooksPath", Value: os.DevNull},
+		},
+		DisableSafeDirectoryForward: true,
+	}
+}
+
 // newGitCmd builds a "git" command that does not open a console window on
 // Windows. All git invocations in this package must go through newGitCmd or
 // newGitCmdContext so a detached daemon's git children never flash a console.
@@ -1963,8 +1994,8 @@ type BinaryChange struct {
 
 // ChangedBinaryFiles lists the binary files a commit or range changes, using
 // the same refs and pathspec as the review diff. Symlinks and submodules are
-// not files and are skipped. A single merge commit reports no files because
-// its combined diff has no single old side.
+// not files and are skipped. A single merge commit is compared with its first
+// parent, including changes introduced by conflict resolution.
 func ChangedBinaryFiles(ctx context.Context, repoPath, gitRef string, extraExcludes ...string) ([]BinaryChange, error) {
 	flags := []string{"--raw", "--numstat", "--no-renames", "--no-abbrev", "-z", "--"}
 	var args []string
@@ -2813,7 +2844,12 @@ func CommitCount(repoPath, rev string) (int, error) {
 // away the boundary commit's parents, so rev-list-based checks see a parentless
 // commit there, while the raw object still names its parents.
 func IsRootCommit(repoPath, rev string) (bool, error) {
-	cmd := newGitCmd("cat-file", "commit", rev)
+	return IsRootCommitCtx(context.Background(), repoPath, rev)
+}
+
+// IsRootCommitCtx is IsRootCommit with a caller context.
+func IsRootCommitCtx(ctx context.Context, repoPath, rev string) (bool, error) {
+	cmd := newGitCmdContext(ctx, "cat-file", "commit", rev)
 	cmd.Dir = repoPath
 
 	out, err := gitOutput(cmd)

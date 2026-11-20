@@ -7,11 +7,11 @@ import (
 	"log"
 	"strings"
 	"sync"
-	"time"
 
 	"go.kenn.io/roborev/internal/agent"
 	"go.kenn.io/roborev/internal/config"
 	gitpkg "go.kenn.io/roborev/internal/git"
+	"go.kenn.io/roborev/internal/proctrack"
 	"go.kenn.io/roborev/internal/review/autotype"
 	"go.kenn.io/roborev/internal/storage"
 )
@@ -175,7 +175,7 @@ func (wp *WorkerPool) processClassifyJob(ctx context.Context, workerID string, j
 		if !ok {
 			return false, "", selectedName, fmt.Errorf("classify_agent %q lost SchemaAgent capability after WithReasoning/WithModel", name)
 		}
-		classifier := newClassifierAdapter(sa, maxBytes, jobLog).withBeforeInvoke(func() {
+		classifier := newClassifierAdapter(sa, maxBytes, newPiInvocationLogWriter(sa.Name(), jobLog)).withBeforeInvoke(func() {
 			if err := wp.db.MarkClassifyAgentInvoked(
 				job.ID, workerID, selectedName, model, sa.CommandLine(),
 			); err != nil {
@@ -199,6 +199,7 @@ func (wp *WorkerPool) processClassifyJob(ctx context.Context, workerID string, j
 		return
 	}
 	if err != nil &&
+		proctrack.FromContext(ctx).Breach() == nil &&
 		backup != "" &&
 		agent.CanonicalName(backup) != agent.CanonicalName(primary) &&
 		agent.CanonicalName(selected) != agent.CanonicalName(backup) {
@@ -351,18 +352,9 @@ func (wp *WorkerPool) broadcastClassifyFailed(job *storage.ReviewJob, errMsg str
 	if wp.broadcaster == nil {
 		return
 	}
-	wp.broadcaster.Broadcast(Event{
-		Type:     "review.failed",
-		TS:       time.Now(),
-		JobID:    job.ID,
-		JobUUID:  job.UUID,
-		Repo:     job.RepoPath,
-		RepoName: job.RepoName,
-		SHA:      job.GitRef,
-		Branch:   job.HookBranch(),
-		Agent:    job.Agent,
-		Error:    errMsg,
-	})
+	event := eventForJob("review.failed", job, job.ID)
+	event.Error = errMsg
+	wp.broadcaster.Broadcast(event)
 }
 
 // broadcastClassifyTerminal emits a review.completed event after a
@@ -376,17 +368,7 @@ func (wp *WorkerPool) broadcastClassifyTerminal(job *storage.ReviewJob) {
 	if wp.broadcaster == nil {
 		return
 	}
-	wp.broadcaster.Broadcast(Event{
-		Type:     "review.completed",
-		TS:       time.Now(),
-		JobID:    job.ID,
-		JobUUID:  job.UUID,
-		Repo:     job.RepoPath,
-		RepoName: job.RepoName,
-		SHA:      job.GitRef,
-		Branch:   job.HookBranch(),
-		Agent:    job.Agent,
-	})
+	wp.broadcaster.Broadcast(eventForJob("review.completed", job, job.ID))
 }
 
 // resolveClassifyDiff returns the diff to feed to the classifier. When

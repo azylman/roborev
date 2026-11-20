@@ -65,6 +65,7 @@ var cliUseCommands = map[string]bool{
 var cliUseLifecyclePaths = map[string]bool{
 	"/api/ping":                   true,
 	"/api/shutdown":               true,
+	"/api/shutdown/interrupt":     true,
 	"/api/update/prepare":         true,
 	"/api/update/renew":           true,
 	"/api/update/release":         true,
@@ -93,6 +94,11 @@ var (
 	cliUseEndpoint atomic.Pointer[daemon.DaemonEndpoint]
 	cliSends       telemetry.SendGroup
 )
+
+func snapshotCLIConsent() {
+	enabled := telemetry.EnabledFromEnv()
+	cliTelemetryEnabled = func() bool { return enabled }
+}
 
 // armCLIUse selects human or agent activity for commands that work through the daemon.
 func armCLIUse(cmd *cobra.Command) {

@@ -252,6 +252,10 @@ type EnqueueSuppliedPanelErrorResponse = ErrorResponse
 
 type EnqueueSuppliedPanelErrorResponseJSON = ErrorResponse
 
+type EnqueueSuppliedPanelErrorResponseJSON410 = ErrorResponse
+
+type EnqueueSuppliedPanelErrorResponseJSON500 = ErrorResponse
+
 type StartPanelSynthesisResponse = ReviewJob
 
 type StartPanelSynthesisErrorResponse = ErrorModel
@@ -377,6 +381,10 @@ type SearchReviewsErrorResponseApplicationProblemPlusJSON503 = ErrorModel
 type ShutdownResponse = ShutdownOutputBody
 
 type ShutdownErrorResponse = ErrorModel
+
+type InterruptShutdownResponse = ShutdownOutputBody
+
+type InterruptShutdownErrorResponse = ErrorModel
 
 type GetStatusResponse = DaemonStatus
 
@@ -749,7 +757,9 @@ type EnqueueSuppliedPanelResp struct {
 	StatusCode   int
 	JSON201      *EnqueueSuppliedPanelResponse
 	JSON400      *EnqueueSuppliedPanelErrorResponse
-	JSON500      *EnqueueSuppliedPanelErrorResponseJSON
+	JSON409      *EnqueueSuppliedPanelErrorResponseJSON
+	JSON410      *EnqueueSuppliedPanelErrorResponseJSON410
+	JSON500      *EnqueueSuppliedPanelErrorResponseJSON500
 }
 
 type StartPanelSynthesisResp struct {
@@ -939,6 +949,14 @@ type ShutdownResp struct {
 	StatusCode                        int
 	JSON200                           *ShutdownResponse
 	ApplicationProblemPlusJSONDefault *ShutdownErrorResponse
+}
+
+type InterruptShutdownResp struct {
+	HTTPResponse                      *http.Response
+	Body                              []byte
+	StatusCode                        int
+	JSON200                           *InterruptShutdownResponse
+	ApplicationProblemPlusJSONDefault *InterruptShutdownErrorResponse
 }
 
 type GetStatusResp struct {
@@ -1933,6 +1951,18 @@ func (c *RawClient) ShutdownRaw(ctx context.Context, reqEditors ...runtime.Reque
 
 	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
 		RequestURL: c.apiClient.GetBaseURL() + "/api/shutdown",
+		Method:     "POST",
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) InterruptShutdownRaw(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/shutdown/interrupt",
 		Method:     "POST",
 	}, reqEditors...)
 	if err != nil {

@@ -344,6 +344,13 @@ func (s *Server) registerHumaAPI(mux *http.ServeMux) huma.API {
 			o.Tags = []string{"daemon"}
 		})
 
+	huma.Post(api, "/api/shutdown/interrupt", s.humaInterruptShutdown,
+		func(o *huma.Operation) {
+			o.OperationID = "interrupt-shutdown"
+			o.Summary = "Interrupt running reviews and shut down the daemon"
+			o.Tags = []string{"daemon"}
+		})
+
 	huma.Post(api, "/api/update/prepare", s.humaPrepareUpdate,
 		func(o *huma.Operation) {
 			o.OperationID = "prepare-update"
@@ -484,6 +491,8 @@ func (s *Server) registerHumaAPI(mux *http.ServeMux) huma.API {
 			o.Responses = jsonResponses(map[string]*huma.Schema{
 				"201": jsonSchema(api, PanelEnqueueResponse{}),
 				"400": errorSchema,
+				"409": errorSchema,
+				"410": errorSchema,
 				"500": errorSchema,
 			})
 		})

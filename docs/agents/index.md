@@ -91,7 +91,7 @@ roborev refine --model claude-sonnet-4-20250514
 | Copilot | OpenAI model name | `gpt-4.1` |
 | Cursor | Model name | `claude-sonnet-4-20250514`, `gpt-4.1` |
 | OpenCode | `provider/model` | `anthropic/claude-sonnet-4-20250514`, `openai/gpt-4.1` |
-| Droid | Factory model name | (see Factory.ai docs) |
+| Droid | Factory model ID, passed as `droid exec -m` | `claude-opus-5-5`, `custom:My-Model-0` |
 | Kilo | `provider/model` | `anthropic/claude-sonnet-4-20250514`, `openai/gpt-4.1` |
 | Kiro | Model name | (see Kiro docs) |
 | Pi | Model name | `claude-sonnet-4-20250514`, `gpt-4.1` |
@@ -114,6 +114,13 @@ model = "gpt-4.1"  # Override for this repo
 
 Model resolution priority: CLI flag > per-repo config > global config > agent
 default.
+
+A workflow model such as `review_model` goes only to the agent its workflow
+selects. If you pick another agent with `--agent` and pass no `--model`, roborev
+skips that workflow model. The generic `model` or `default_model` still applies
+when you pick the default agent; any other agent runs on its own default model.
+See
+[Workflow-Specific Agent and Model](/docs/configuration/#workflow-specific-agent-and-model).
 
 ## Strict Claude Code Reviews
 
@@ -408,7 +415,8 @@ refuses this agentic mode.
 
 Tests that start a loopback server, such as `httptest.NewServer`, fail inside
 this sandbox. Run `make test-sandbox-integration` with nono and Codex on PATH to
-exercise the policy with real binaries and a local stand-in Responses server.
+exercise the policy with real binaries and a local stand-in Responses server. On
+Linux x86_64, `mise install` in a roborev checkout installs the pinned nono.
 
 ## Pi
 
@@ -617,8 +625,8 @@ short `WaitDelay` so orphan pipes cannot hang availability checks forever).
 ## ACP (Agent Client Protocol)
 
 ACP lets you integrate any agent that speaks the
-[Agent Client Protocol](https://zed.dev/blog/acp), even if roborev doesn't have
-a built-in adapter for it. Configure one or more named ACP agents in
+[Agent Client Protocol](https://zed.dev/acp), even if roborev doesn't have a
+built-in adapter for it. Configure one or more named ACP agents in
 `~/.roborev/config.toml`:
 
 ```toml

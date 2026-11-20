@@ -3,7 +3,7 @@ title: Agent Client Protocol (ACP)
 description: Integrate any ACP-compatible agent with roborev
 ---
 
-ACP is an [open protocol from Zed](https://zed.dev/blog/acp) for editor-to-agent
+ACP is an [open protocol from Zed](https://zed.dev/acp) for editor-to-agent
 communication over stdin/stdout JSON-RPC. roborev uses ACP to integrate agents
 that don't have built-in adapters. If an agent speaks ACP (or has a wrapper that
 does), you can plug it in.
@@ -386,11 +386,13 @@ names.
 
 ### Which model wins for an ACP agent?
 
-Workflow models follow their paired workflow agent. If `review_agent = "codex"`
-and `review_model = "gpt-5.4"`, selecting a Gemini ACP agent with
-`--agent acp.agy-sdk` does not pass `gpt-5.4` to that agent; the ACP agent keeps
-its `[acp.agy-sdk].model` instead. This also applies when the workflow agent is
-inherited from the default agent.
+Workflow models follow their paired workflow agent, as they do for every agent
+(see
+[Workflow-Specific Agent and Model](/docs/configuration/#workflow-specific-agent-and-model)).
+If `review_agent = "codex"` and `review_model = "gpt-5.4"`, selecting a Gemini
+ACP agent with `--agent acp.agy-sdk` does not pass `gpt-5.4` to that agent; the
+ACP agent keeps its `[acp.agy-sdk].model` instead. This also applies when the
+workflow agent is inherited from the default agent.
 
 A workflow model does apply when its workflow agent resolves to the selected ACP
 agent. An explicit `--model` wins on the single-agent path (if `default_panel`

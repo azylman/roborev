@@ -25,6 +25,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	gitcmd "go.kenn.io/kit/git/cmd"
 	"go.kenn.io/kit/stacktest"
 
 	"go.kenn.io/roborev/internal/agent"
@@ -251,7 +252,6 @@ func TestWorkerPoolConcurrency(t *testing.T) {
 	t.Parallel()
 	const workers = 4
 	tc := newWorkerTestContext(t, workers)
-	sha := testutil.GetHeadSHA(t, tc.TmpDir)
 
 	const agentName = "worker-concurrency-blocking"
 	started := make(chan struct{}, workers+1)
@@ -269,8 +269,18 @@ func TestWorkerPoolConcurrency(t *testing.T) {
 		},
 	})
 
+	// Task jobs carry their prompt, so workers reach the agent without the
+	// dozens of git commands a commit review runs first. On a loaded Windows
+	// runner those commands took longer than the wait below.
 	for range workers + 1 {
-		tc.createJobWithAgent(t, sha, agentName)
+		_, err := tc.DB.EnqueueJob(storage.EnqueueOpts{
+			RepoID:  tc.Repo.ID,
+			GitRef:  "prompt",
+			Agent:   agentName,
+			Prompt:  "Review this codebase",
+			JobType: storage.JobTypeTask,
+		})
+		require.NoError(t, err)
 	}
 
 	tc.startPool()
@@ -297,7 +307,7 @@ func TestWorkerPoolPendingCancellation(t *testing.T) {
 	tc.assertJobPendingCancel(t, job.ID, true)
 
 	canceled := false
-	tc.Pool.registerRunningJob(job.ID, func() { canceled = true }, time.Time{})
+	tc.Pool.registerRunningJob(job.ID, func() { canceled = true }, time.Time{}, nil)
 
 	if !canceled {
 		assert.Condition(t, func() bool {
@@ -335,7 +345,7 @@ func TestWorkerPoolPendingCancellationAfterDBCancel(t *testing.T) {
 	tc.assertJobPendingCancel(t, job.ID, true)
 
 	canceled := false
-	tc.Pool.registerRunningJob(job.ID, func() { canceled = true }, time.Time{})
+	tc.Pool.registerRunningJob(job.ID, func() { canceled = true }, time.Time{}, nil)
 
 	if !canceled {
 		assert.Condition(t, func() bool {
@@ -595,7 +605,7 @@ func TestWorkerPoolCancelJobRegisteredDuringCheck(t *testing.T) {
 	job := tc.createAndClaimJob(t, "register-during", testWorkerID)
 
 	canceled := false
-	tc.Pool.registerRunningJob(job.ID, func() { canceled = true }, time.Time{})
+	tc.Pool.registerRunningJob(job.ID, func() { canceled = true }, time.Time{}, nil)
 
 	if !tc.Pool.CancelJob(job.ID) {
 		assert.Condition(t, func() bool {
@@ -620,7 +630,7 @@ func TestWorkerPoolCancelJobConcurrentRegister(t *testing.T) {
 	cancelFunc := func() { canceled.Add(1) }
 
 	tc.Pool.testHookAfterSecondCheck = func() {
-		tc.Pool.registerRunningJob(job.ID, cancelFunc, time.Time{})
+		tc.Pool.registerRunningJob(job.ID, cancelFunc, time.Time{}, nil)
 	}
 
 	result := tc.Pool.CancelJob(job.ID)
@@ -825,7 +835,7 @@ func TestCleanupStaleCIWorktreesRemovesOrphanedDetachedWorktree(t *testing.T) {
 		ID:       42,
 		RepoPath: repo.Path(),
 		GitRef:   headSHA,
-	})
+	}, gitcmd.Runner{})
 	require.NoError(t, err)
 	require.NotEmpty(t, worktreeDir)
 	require.NotNil(t, normalCleanup)
@@ -1001,11 +1011,24 @@ func TestWorkerCIPanelMembersAtDifferentHeadsRunConcurrentlyInSeparateWorktrees(
 type sessionStreamingTestAgent struct {
 	name       string
 	streamLine string
+	sessionCLI string
+	sessionID  string
+	state      *sessionStreamingTestAgentState
+}
+
+type sessionStreamingTestAgentState struct {
+	mu              sync.Mutex
+	observedSession string
 }
 
 func (a *sessionStreamingTestAgent) Name() string { return a.name }
 
 func (a *sessionStreamingTestAgent) Review(ctx context.Context, repoPath, commitSHA, prompt string, output io.Writer) (string, error) {
+	if a.state != nil {
+		a.state.mu.Lock()
+		a.state.observedSession = a.sessionID
+		a.state.mu.Unlock()
+	}
 	if output != nil {
 		if _, err := io.WriteString(output, a.streamLine+"\n"); err != nil {
 			return "", err
@@ -1027,6 +1050,12 @@ func (a *sessionStreamingTestAgent) WithModel(model string) agent.Agent {
 }
 
 func (a *sessionStreamingTestAgent) CommandLine() string { return a.name }
+func (a *sessionStreamingTestAgent) SessionCLI() string  { return a.sessionCLI }
+func (a *sessionStreamingTestAgent) WithSessionID(sessionID string) agent.Agent {
+	clone := *a
+	clone.sessionID = sessionID
+	return &clone
+}
 
 func TestProcessJob_CapturesSessionID(t *testing.T) {
 	t.Parallel()
@@ -1334,35 +1363,40 @@ func TestCaptureTokenUsageForSessionKeepsJobLogWhenSessionIsReused(t *testing.T)
 
 func TestCaptureTokenUsageForSessionRetriesUntilFreshSessionIsIndexed(t *testing.T) {
 	t.Setenv("ROBOREV_DATA_DIR", t.TempDir())
-	tc := newWorkerTestContext(t, 1)
-	sha := testutil.GetHeadSHA(t, tc.TmpDir)
-	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, "codex")
-	require.NoError(t, testutil.CompleteReviewFixture(tc.DB, job.ID, "codex", "prompt", "No issues found."))
+	// The retry window is measured on the clock, so a slow runner could use it
+	// up before the third lookup. Fake time makes the lookups and the waits
+	// between them take exactly the configured intervals.
+	synctest.Test(t, func(t *testing.T) {
+		tc := newWorkerTestContext(t, 1)
+		sha := testutil.GetHeadSHA(t, tc.TmpDir)
+		job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, "codex")
+		require.NoError(t, testutil.CompleteReviewFixture(tc.DB, job.ID, "codex", "prompt", "No issues found."))
 
-	var attempts atomic.Int32
-	tc.Pool.tokenUsageFetcher = func(context.Context, string) (*tokens.Usage, error) {
-		if attempts.Add(1) < 3 {
-			return nil, nil
+		var attempts atomic.Int32
+		tc.Pool.tokenUsageFetcher = func(context.Context, string) (*tokens.Usage, error) {
+			if attempts.Add(1) < 3 {
+				return nil, nil
+			}
+			return &tokens.Usage{
+				OutputTokens: 481,
+				CostUSD:      0.17,
+				HasCost:      true,
+			}, nil
 		}
-		return &tokens.Usage{
-			OutputTokens: 481,
-			CostUSD:      0.17,
-			HasCost:      true,
-		}, nil
-	}
 
-	tc.Pool.captureTokenUsageForSession(
-		t.Context(), testWorkerID, job, "fresh-session-123",
-	)
+		tc.Pool.captureTokenUsageForSession(
+			t.Context(), testWorkerID, job, "fresh-session-123",
+		)
 
-	updated, err := tc.DB.GetJobByID(job.ID)
-	require.NoError(t, err)
-	usage := tokens.ParseJSON(updated.TokenUsage)
-	require.NotNil(t, usage)
-	assert.Equal(t, int32(3), attempts.Load())
-	assert.Equal(t, int64(481), usage.OutputTokens)
-	assert.True(t, usage.HasCost)
-	assert.InDelta(t, 0.17, usage.CostUSD, 1e-9)
+		updated, err := tc.DB.GetJobByID(job.ID)
+		require.NoError(t, err)
+		usage := tokens.ParseJSON(updated.TokenUsage)
+		require.NotNil(t, usage)
+		assert.Equal(t, int32(3), attempts.Load())
+		assert.Equal(t, int64(481), usage.OutputTokens)
+		assert.True(t, usage.HasCost)
+		assert.InDelta(t, 0.17, usage.CostUSD, 1e-9)
+	})
 }
 
 func TestCaptureTokenUsageForSessionDoesNotRetryUnavailableProvider(t *testing.T) {
@@ -1699,7 +1733,7 @@ func TestProcessJob_CIPromptFallbackKeepsDefaultRefAfterConfigParseError(t *test
 	assert.Contains(t, stored.Output, "Global review instructions loaded from the default branch.")
 }
 
-func TestProcessJob_BuildsDirtyPromptFromPersistedDirtyFiles(t *testing.T) {
+func TestProcessJob_DirtyPromptClearsFrozenBinaryEvidence(t *testing.T) {
 	t.Parallel()
 	tc := newWorkerTestContext(t, 1)
 
@@ -1714,11 +1748,12 @@ func TestProcessJob_BuildsDirtyPromptFromPersistedDirtyFiles(t *testing.T) {
 	})
 
 	job, err := tc.DB.EnqueueJob(storage.EnqueueOpts{
-		RepoID:     tc.Repo.ID,
-		GitRef:     "dirty",
-		Agent:      agentName,
-		JobType:    storage.JobTypeDirty,
-		DirtyFiles: []string{"go.sum"},
+		RepoID:                tc.Repo.ID,
+		GitRef:                "dirty",
+		Agent:                 agentName,
+		JobType:               storage.JobTypeDirty,
+		DirtyFiles:            []string{"go.sum"},
+		PanelMemberConfigJSON: `{"binary_evidence":true}`,
 	})
 	require.NoError(t, err)
 
@@ -2586,7 +2621,7 @@ func TestWorkerPoolCancelJobFinalCheckDeadlockSafe(t *testing.T) {
 	}
 
 	tc.Pool.testHookAfterSecondCheck = func() {
-		tc.Pool.registerRunningJob(job.ID, cancelFunc, time.Time{})
+		tc.Pool.registerRunningJob(job.ID, cancelFunc, time.Time{}, nil)
 	}
 
 	done := make(chan bool)

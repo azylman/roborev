@@ -18,6 +18,7 @@ var (
 )
 
 func main() {
+	snapshotCLIConsent()
 	code := executeCLI(newRootCmd(), os.Args[1:])
 	waitCLIUse()
 	if code != 0 {
@@ -110,6 +111,7 @@ func newRootCmd() *cobra.Command {
 	rootCmd.AddCommand(verifyWebAssetsCmd())
 
 	applyCommandGrammar(rootCmd)
+	rootCmd.AddCommand(cliSearchCmd(rootCmd))
 	applyRootHelp(rootCmd)
 	configureCLIErrors(rootCmd)
 	return rootCmd

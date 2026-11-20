@@ -113,6 +113,9 @@ keep `healthy` false while their retries run, but do not prevent `ready` from
 becoming true. Deployment checks may use `ready`; availability monitoring must
 use `healthy`.
 
+A missing cost usage source makes `healthy` false, but does not block `ready` or
+suppress CI recovery information. Reviews can run without cost accounting.
+
 Polling continues for other pull requests and repositories after a failure. Each
 repository stays unhealthy until its next successful poll or until a successful
 discovery removes it from the configured set. Discovery failures remain
@@ -274,6 +277,10 @@ Common fields:
 - `sha`: Commit SHA (or `dirty` for uncommitted changes)
 - `branch`: Branch used for event and hook matching, when known. For CI
     pull-request reviews this is the PR base branch
+- `source`: Why roborev started the review, such as `ci` or `ci_branch`. Omitted
+    for reviews you start yourself. See
+    [Source Filtering](/docs/guides/hooks/#source-filtering)
+- `panel_role`: `member` or `synthesis` for a review panel job
 - `agent`: Agent that processed the review, when available
 - `worktree_path`: Worktree path used by the job, when different from the main
     repo path

@@ -67,6 +67,8 @@ type ExportReviewsPage struct {
 
 type ExportReview struct {
 	ReviewID            uuid.UUID              `json:"review_id"`
+	SourceMachineID     uuid.UUID              `json:"source_machine_id,omitzero" doc:"The roborev machine that ran the review. Another machine's ID for a review pulled through sync."`
+	ExportedByMachineID uuid.UUID              `json:"exported_by_machine_id,omitzero" doc:"The machine running this export."`
 	Status              string                 `json:"status"`
 	Verdict             string                 `json:"verdict" doc:"pass, fail, or unknown when a legacy review has no recorded verdict."`
 	CreatedAt           string                 `json:"created_at"`
@@ -130,8 +132,11 @@ func (d *ExportDocument) UnmarshalJSON(raw []byte) error {
 }
 
 const (
-	exportDocumentSchemaName = "StructuredReviewDocument"
-	exportFindingSchemaName  = "StructuredReviewFinding"
+	exportDocumentSchemaName       = "StructuredReviewDocument"
+	exportFindingSchemaName        = "StructuredReviewFinding"
+	exportCheckSchemaName          = "StructuredReviewCheck"
+	exportCheckedFindingSchemaName = "StructuredReviewCheckedFinding"
+	exportCheckVerdictSchemaName   = "StructuredReviewCheckVerdict"
 )
 
 // Schema describes the document as it appears on the wire. Reflection cannot
@@ -167,6 +172,45 @@ func (ExportDocument) Schema(r huma.Registry) *huma.Schema {
 		},
 		Required: []string{"severity", "problem", "fix", "location"},
 	}
+	schemas[exportCheckVerdictSchemaName] = &huma.Schema{
+		Type:                 huma.TypeObject,
+		Description:          "One verdict as the CI checker returned it. A member the checker left blank is omitted.",
+		AdditionalProperties: false,
+		Properties: map[string]*huma.Schema{
+			"keep":     {Type: huma.TypeBoolean, Description: "The checker's decision to keep the finding."},
+			"evidence": {Type: huma.TypeString, Description: "The command the checker ran and its output, or what refutes the finding."},
+			"reason":   {Type: huma.TypeString, Description: "The checker's one-sentence explanation."},
+		},
+	}
+	schemas[exportCheckedFindingSchemaName] = &huma.Schema{
+		Type:                 huma.TypeObject,
+		Description:          "One finding the CI checker tried and what became of it.",
+		AdditionalProperties: false,
+		Properties: map[string]*huma.Schema{
+			"outcome": {Type: huma.TypeString, Description: "kept when the finding stayed in the review, or dropped when the checker refuted it and roborev removed it."},
+			"finding": {Ref: refPrefix + exportFindingSchemaName, Description: "The finding as the checker received it, before any rewrite."},
+			"verdicts": {
+				Type:        huma.TypeArray,
+				Items:       &huma.Schema{Ref: refPrefix + exportCheckVerdictSchemaName},
+				Description: "Every verdict the checker returned for this finding. A finding drops only with exactly one verdict whose keep is false and whose evidence and reason are both set; otherwise it is kept, including when this list is empty.",
+			},
+		},
+		Required: []string{"outcome", "finding", "verdicts"},
+	}
+	schemas[exportCheckSchemaName] = &huma.Schema{
+		Type:                 huma.TypeObject,
+		Description:          "How the CI checker judged the review's findings before roborev stored and posted it.",
+		AdditionalProperties: false,
+		Properties: map[string]*huma.Schema{
+			"status": {Type: huma.TypeString, Description: "completed when the checker returned verdicts, or failed when it ran but the review was stored unchecked."},
+			"findings": {
+				Type:        huma.TypeArray,
+				Items:       &huma.Schema{Ref: refPrefix + exportCheckedFindingSchemaName},
+				Description: "One entry per finding the checker received, in that order. Kept entries keep their order in the document's findings. Empty when status is failed.",
+			},
+		},
+		Required: []string{"status", "findings"},
+	}
 	schemas[exportDocumentSchemaName] = &huma.Schema{
 		Type:                 huma.TypeObject,
 		Description:          "The canonical JSON review document. The Go package go.kenn.io/roborev/pkg/structuredreview decodes and renders it.",
@@ -186,6 +230,10 @@ func (ExportDocument) Schema(r huma.Registry) *huma.Schema {
 				Type:        huma.TypeArray,
 				Items:       &huma.Schema{Type: huma.TypeString},
 				Description: "Names of the input reviews that findings cite in sources, indexed by review number minus one.",
+			},
+			"check": {
+				Ref:         refPrefix + exportCheckSchemaName,
+				Description: "The CI checker's record for this review. Omitted when no checker ran.",
 			},
 		},
 		Required: []string{"schema_version", "summary", "findings"},
@@ -231,6 +279,7 @@ type exportCursor struct {
 
 type exportReviewRow struct {
 	reviewID            uuid.UUID
+	sourceMachineID     sql.Null[uuid.UUID]
 	jobUUID             uuid.UUID
 	verdictBool         sql.NullInt64
 	reviewCreated       string
@@ -279,6 +328,10 @@ func (db *DB) ExportReviews(opts ExportReviewsOptions) (ExportReviewsPage, error
 	if err != nil {
 		return ExportReviewsPage{}, err
 	}
+	machineID, err := db.GetMachineID()
+	if err != nil {
+		return ExportReviewsPage{}, err
+	}
 
 	rows, err := db.queryExportReviewRows(opts, cursor)
 	if err != nil {
@@ -297,7 +350,7 @@ func (db *DB) ExportReviews(opts ExportReviewsOptions) (ExportReviewsPage, error
 			page.Truncated = true
 			break
 		}
-		review := row.toExportReview(opts.Profile)
+		review := row.toExportReview(opts.Profile, machineID)
 		review.Experiments, err = db.GetExperimentAssignmentsForJobUUID(row.jobUUID)
 		if err != nil {
 			return ExportReviewsPage{}, err
@@ -387,7 +440,7 @@ func exportReviewRowsQuery(opts ExportReviewsOptions, cursor *exportCursor) (str
 	}
 
 	query := `
-		SELECT rv.uuid, j.uuid, rv.verdict_bool, rv.created_at,
+		SELECT rv.uuid, NULLIF(j.source_machine_id, ''), j.uuid, rv.verdict_bool, rv.created_at,
 		       COALESCE(rv.closed, 0), rv.updated_at, ` + outputExpr + `,
 		       j.status, j.enqueued_at, j.started_at, j.finished_at, j.agent, j.model,
 		       j.git_ref, COALESCE(j.job_type, 'review'), j.branch, j.ci_base_branch,
@@ -408,6 +461,7 @@ func scanExportReviewRow(rows *sql.Rows) (exportReviewRow, error) {
 	var row exportReviewRow
 	err := rows.Scan(
 		&row.reviewID,
+		&row.sourceMachineID,
 		&row.jobUUID,
 		&row.verdictBool,
 		&row.reviewCreated,
@@ -447,7 +501,7 @@ func scanExportReviewRow(rows *sql.Rows) (exportReviewRow, error) {
 	return row, err
 }
 
-func (row exportReviewRow) toExportReview(profile ExportProfile) ExportReview {
+func (row exportReviewRow) toExportReview(profile ExportProfile, machineID uuid.UUID) ExportReview {
 	completed := parseSQLiteTime(row.reviewCreated)
 	repo := row.project
 	if row.repoIdentity.Valid && strings.TrimSpace(row.repoIdentity.String) != "" {
@@ -455,6 +509,8 @@ func (row exportReviewRow) toExportReview(profile ExportProfile) ExportReview {
 	}
 	review := ExportReview{
 		ReviewID:            row.reviewID,
+		SourceMachineID:     machineID,
+		ExportedByMachineID: machineID,
 		Status:              row.status,
 		Verdict:             exportVerdict(row.verdictBool),
 		CreatedAt:           formatExportTime(parseSQLiteTime(row.enqueuedAt)),
@@ -473,6 +529,9 @@ func (row exportReviewRow) toExportReview(profile ExportProfile) ExportReview {
 		Subagents:           []ExportSubagent{},
 		Experiments:         []ExperimentAssignment{},
 		ResumeSourceJobUUID: nil,
+	}
+	if row.sourceMachineID.Valid && row.sourceMachineID.V != uuid.Nil() {
+		review.SourceMachineID = row.sourceMachineID.V
 	}
 	if row.resumeSourceJobUUID.Valid {
 		review.ResumeSourceJobUUID = &row.resumeSourceJobUUID.V

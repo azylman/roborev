@@ -30,7 +30,7 @@ func TestMuseBuildArgs(t *testing.T) {
 			a := NewMuseAgent("").WithReasoning(tc.reasoning).WithAgentic(tc.agentic).(*MuseAgent)
 			args := a.buildArgs(a.Agentic, "prompt.md")
 			assert := assert.New(t)
-			assert.Contains(strings.Join(args, " "), "--prompt-file prompt.md")
+			assertArgsContainContiguous(t, args, []string{"--prompt-file", "prompt.md"})
 			if tc.agentic {
 				assert.Contains(args, "--yolo")
 				assert.NotContains(args, `run.toolset=["read_file","search"]`)
@@ -38,16 +38,20 @@ func TestMuseBuildArgs(t *testing.T) {
 				assert.NotContains(args, "--yolo")
 				assert.Contains(args, "--no-foreign-personal-context")
 				for _, override := range []string{`run.toolset=["read_file","search"]`, "hooks={}", "managed_hooks_path=null"} {
-					assert.Contains(strings.Join(args, " "), "-c "+override)
+					assertArgsContainContiguous(t, args, []string{"-c", override})
 				}
 			}
 			if tc.reasoning == ReasoningThorough {
-				assert.Contains(strings.Join(args, " "), "--reasoning-effort high")
+				assertArgsContainContiguous(t, args, []string{"--reasoning-effort", "high"})
 			}
 		})
 	}
 	a := NewMuseAgent("")
 	assert.Contains(t, a.CommandLine(), "--prompt-file <prompt-file>")
+	withSession := a.WithSessionID("session-123").(*MuseAgent)
+	assertArgsContainContiguous(t, withSession.buildArgs(false, "prompt.md"), []string{"--session-id", "session-123"})
+	assert.NotContains(t, withSession.buildArgs(false, "prompt.md"), "--no-session-log")
+	assert.NotContains(t, withSession.PlanningCommandLine(), "session-123")
 }
 
 func TestMuseReviewPromptAndOutput(t *testing.T) {
@@ -360,4 +364,55 @@ exec "$MUSE_BINARY" "$@" --provider echo
 			assert.Equal(t, "echo: contract prompt", result)
 		})
 	}
+}
+
+func TestMuseReviewPersistsAndResumesSession(t *testing.T) {
+	skipIfWindows(t)
+	withUnsafeAgents(t, false)
+	configHome := t.TempDir()
+	dataHome := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", configHome)
+	t.Setenv("XDG_DATA_HOME", dataHome)
+	t.Setenv("TMPDIR", t.TempDir())
+	command := writeTempCommand(t, `#!/bin/sh
+case "$1" in *etxtbsy*) exit 0;; esac
+set -eu
+session=""
+prev=""
+for arg in "$@"; do
+ if [ "$prev" = "--session-id" ]; then session="$arg"; fi
+ prev="$arg"
+done
+test -n "$session"
+dir="$XDG_DATA_HOME/muse/sessions/2026/11/19/$session"
+mkdir -p "$dir"
+printf 'turn\n' >> "$dir/session.jsonl"
+touch "$dir/.session.lock"
+count="$(wc -l < "$dir/session.jsonl" | tr -d ' ')"
+printf 'No issues found (turn %s).\n' "$count"
+`)
+	repo := t.TempDir()
+	var captured string
+	var buf bytes.Buffer
+	writer1 := NewSessionCaptureWriter(&buf, func(id string) { captured = id }, nil)
+	res1, err := NewMuseAgent(command).Review(t.Context(), repo, "HEAD", "turn 1", writer1)
+	require.NoError(t, err)
+	writer1.Flush()
+	assert.Equal(t, "No issues found (turn 1).", res1)
+	require.NotEmpty(t, captured)
+	assert.Equal(t, captured, writer1.SessionID())
+	sessionLog := filepath.Join(dataHome, "muse", "sessions", "2026", "11", "19", captured, "session.jsonl")
+	assert.FileExists(t, sessionLog)
+	assert.NoFileExists(t, filepath.Join(dataHome, "muse", "sessions", "2026", "11", "19", captured, ".session.lock"))
+
+	var captured2 string
+	writer2 := NewSessionCaptureWriter(&buf, func(id string) { captured2 = id }, nil)
+	res2, err := NewMuseAgent(command).WithSessionID(captured).Review(t.Context(), repo, "HEAD", "turn 2", writer2)
+	require.NoError(t, err)
+	writer2.Flush()
+	assert.Equal(t, "No issues found (turn 2).", res2)
+	assert.Equal(t, captured, captured2)
+	data, err := os.ReadFile(sessionLog)
+	require.NoError(t, err)
+	assert.Equal(t, "turn\nturn\n", string(data))
 }

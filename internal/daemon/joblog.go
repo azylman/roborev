@@ -3,6 +3,8 @@ package daemon
 import (
 	"bufio"
 	"bytes"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -14,8 +16,10 @@ import (
 	"sync"
 	"time"
 
+	"go.kenn.io/roborev/internal/agent"
 	"go.kenn.io/roborev/internal/config"
 	"go.kenn.io/roborev/internal/storage"
+	"go.kenn.io/roborev/internal/tokens"
 )
 
 var jobLogOpenRetryInterval = 5 * time.Second
@@ -99,6 +103,25 @@ func ResolveJobLogIdentity(job *storage.ReviewJob) (JobLogIdentity, error) {
 	identity.Agent = recordedAgent
 	identity.Recorded = true
 	return identity, nil
+}
+
+// parseJobLogUsage reads token usage from a job's log in the event format of
+// the agent that wrote it. jobAgent is the job row's agent, used when the log
+// does not record which agent owns it.
+func parseJobLogUsage(jobID int64, jobAgent string) (*tokens.Usage, error) {
+	agentName := jobAgent
+	if recorded, err := JobLogAgent(jobID); err == nil &&
+		recorded != storage.AutoDesignAgentSentinel {
+		agentName = recorded
+	}
+	return tokens.ParseJobLogUsageFile(agent.CanonicalName(agentName), JobLogPath(jobID))
+}
+
+// logUsageCoversSeveralSessions reports whether log usage sums more than one
+// provider session. A single provider lookup covers one session, so merging
+// its total would replace the sum with one session's share.
+func logUsageCoversSeveralSessions(logUsage *tokens.Usage) bool {
+	return logUsage != nil && logUsage.ExpectedProviderSessions > 1
 }
 
 func jobLogAppendMarkerPath(jobID int64) string {
@@ -510,4 +533,128 @@ func (w *jobLogWriter) flushBufferLocked(buf *bytes.Buffer) error {
 		}
 	}
 	return nil
+}
+
+// piJobLogSink keeps compaction state for one output stream. The Pi adapter
+// serializes writes to that stream. It compacts repeated usage in stored Pi
+// events. Compaction leaves live rendering and invocation capture unchanged.
+type piJobLogSink struct {
+	out       io.Writer
+	pending   []byte
+	assistant bool
+	usage     jsontext.Value
+}
+
+// newPiInvocationLogWriter creates separate compaction state for each output
+// stream.
+func newPiInvocationLogWriter(name string, out io.Writer) io.Writer {
+	if name == "pi" {
+		return &piJobLogSink{out: out}
+	}
+	return out
+}
+
+func (w *piJobLogSink) Write(p []byte) (int, error) {
+	var output bytes.Buffer
+	for rest := p; len(rest) > 0; {
+		end := bytes.IndexByte(rest, '\n') + 1
+		if end == 0 {
+			end = len(rest)
+		}
+		record := rest[:end]
+		rest = rest[end:]
+		if len(w.pending) == 0 && record[end-1] == '\n' {
+			output.Write(w.compact(record))
+			continue
+		}
+		// Store split-record bytes now; observe the record once it completes.
+		output.Write(record)
+		w.pending = append(w.pending, record...)
+		if record[end-1] == '\n' {
+			w.compact(w.pending)
+			w.pending = nil
+		}
+	}
+	if _, err := w.out.Write(output.Bytes()); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+func (w *piJobLogSink) compact(line []byte) []byte {
+	var ev struct {
+		Type    string `json:"type"`
+		Message struct {
+			Role string `json:"role"`
+		} `json:"message"`
+		Event struct {
+			Type string `json:"type"`
+		} `json:"assistantMessageEvent"`
+		Usage jsontext.Value `json:"usage"`
+	}
+	err := json.Unmarshal(line, &ev)
+	if err != nil || ev.Type != "message_update" {
+		w.assistant = err == nil && ev.Type == "message_start" && ev.Message.Role == "assistant"
+		w.usage = nil
+		return line
+	}
+	if !w.assistant {
+		return line
+	}
+	if len(ev.Usage) == 0 || ev.Event.Type == "" {
+		w.usage = nil
+		return line
+	}
+	delta := ev.Usage.Kind() == '{' && (ev.Event.Type == "text_delta" ||
+		ev.Event.Type == "thinking_delta" || ev.Event.Type == "toolcall_delta")
+	same := bytes.Equal(ev.Usage, w.usage)
+	if delta && same {
+		return removePiUsage(line)
+	}
+	if delta {
+		w.usage = ev.Usage
+	} else if !same {
+		w.usage = nil
+	}
+	return line
+}
+
+// removePiUsage splices the member from an already validated event without
+// changing the spelling, ordering, or whitespace of the remaining members.
+func removePiUsage(line []byte) []byte {
+	dec := jsontext.NewDecoder(bytes.NewReader(line))
+	if _, err := dec.ReadToken(); err != nil {
+		return line
+	}
+	for dec.PeekKind() != '}' {
+		start := int(dec.InputOffset())
+		key, err := dec.ReadToken()
+		if err != nil {
+			return line
+		}
+		isUsage := key.String() == "usage"
+		if _, err := dec.ReadValue(); err != nil {
+			return line
+		}
+		if !isUsage {
+			continue
+		}
+		end := int(dec.InputOffset())
+		i := start
+		for i < end && (line[i] == ' ' || line[i] == '\t' || line[i] == '\r' || line[i] == '\n') {
+			i++
+		}
+		if line[i] != ',' {
+			i = end
+			for i < len(line) && (line[i] == ' ' || line[i] == '\t' || line[i] == '\r' || line[i] == '\n') {
+				i++
+			}
+			if i >= len(line) || line[i] != ',' {
+				return line
+			}
+			end = i + 1
+		}
+		return append(append([]byte{}, line[:start]...), line[end:]...)
+	}
+	return line
 }

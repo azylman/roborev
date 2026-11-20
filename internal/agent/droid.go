@@ -7,11 +7,14 @@ import (
 	"io"
 	"os/exec"
 	"strings"
+
+	"go.kenn.io/roborev/internal/proctrack"
 )
 
 // DroidAgent runs code reviews using Factory's Droid CLI
 type DroidAgent struct {
 	Command   string         // The droid command to run (default: "droid")
+	Model     string         // Factory model ID passed with -m (e.g. "custom:My-Model-0")
 	Reasoning ReasoningLevel // Reasoning level for the agent
 	Agentic   bool           // Whether agentic mode is enabled (allow file edits)
 }
@@ -27,7 +30,7 @@ func NewDroidAgent(command string) *DroidAgent {
 func (a *DroidAgent) clone(opts ...agentCloneOption) *DroidAgent {
 	cfg := newAgentCloneConfig(
 		a.Command,
-		"",
+		a.Model,
 		a.Reasoning,
 		a.Agentic,
 		"",
@@ -35,6 +38,7 @@ func (a *DroidAgent) clone(opts ...agentCloneOption) *DroidAgent {
 	)
 	return &DroidAgent{
 		Command:   cfg.Command,
+		Model:     cfg.Model,
 		Reasoning: cfg.Reasoning,
 		Agentic:   cfg.Agentic,
 	}
@@ -50,9 +54,12 @@ func (a *DroidAgent) WithAgentic(agentic bool) Agent {
 	return a.clone(withClonedAgentic(agentic))
 }
 
-// WithModel returns the agent unchanged (model selection not supported for droid).
+// WithModel returns a copy of the agent configured to use the specified model.
 func (a *DroidAgent) WithModel(model string) Agent {
-	return a
+	if model == "" {
+		return a
+	}
+	return a.clone(withClonedModel(model))
 }
 
 // droidReasoningEffort maps ReasoningLevel to droid-specific effort values
@@ -104,6 +111,10 @@ func (a *DroidAgent) buildArgs(agenticMode, planning bool) []string {
 		}
 	}
 
+	if a.Model != "" {
+		args = append(args, "-m", a.Model)
+	}
+
 	// Set reasoning effort if specified
 	if effort := a.droidReasoningEffort(); effort != "" {
 		args = append(args, "--reasoning-effort", effort)
@@ -131,7 +142,7 @@ func (a *DroidAgent) Review(ctx context.Context, repoPath, commitSHA, prompt str
 		cmd.Stderr = &stderr
 	}
 
-	if err := cmd.Run(); err != nil {
+	if err := proctrack.Run(ctx, cmd); err != nil {
 		if ctxErr := contextProcessError(ctx, tracker, err, nil); ctxErr != nil {
 			return "", ctxErr
 		}

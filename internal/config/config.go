@@ -97,6 +97,7 @@ func markConfigValidationError(err error) error {
 type HookConfig struct {
 	Event    string   `toml:"event"`                // "review.failed", "review.completed", "review.*"
 	Branches []string `toml:"branches"`             // optional branch globs (path.Match); empty = all branches
+	Sources  []string `toml:"sources"`              // optional job sources such as "ci"; empty = every review
 	Command  string   `toml:"command"`              // shell command with {var} templates
 	Type     string   `toml:"type"`                 // "beads", "kata", or "webhook"; empty or "command" runs Command
 	URL      string   `toml:"url" sensitive:"true"` // webhook destination URL when Type is "webhook"
@@ -244,6 +245,7 @@ type Config struct {
 	DaemonTLS                  DaemonTLSConfig                 `toml:"daemon_tls"`
 	ServerAddr                 string                          `toml:"server_addr"`
 	MaxWorkers                 int                             `toml:"max_workers"`
+	AgentMemoryMaxMB           int                             `toml:"agent_memory_max_mb" comment:"Fail a job when its processes' resident memory (RSS), added together, exceeds this many MiB. Shared pages count once per process, so the sum can read well above the memory actually used. 0 or unset disables the limit. Linux and macOS only."`
 	ReviewContextCount         int                             `toml:"review_context_count"`
 	ReuseReviewSessionLookback int                             `toml:"reuse_review_session_lookback"` // 0 means no candidate cap
 	Experiments                map[string]ExperimentDefinition `toml:"experiments"`
@@ -413,6 +415,7 @@ type Config struct {
 	OpenCodeCmd   string `toml:"opencode_cmd"`
 	MuseCmd       string `toml:"muse_cmd"`
 	GrokCmd       string `toml:"grok_cmd"`
+	DroidCmd      string `toml:"droid_cmd"`
 
 	// API keys (optional - agents use subscription auth by default)
 	AnthropicAPIKey string `toml:"anthropic_api_key" sensitive:"true"`
@@ -717,6 +720,9 @@ func (c *Config) Validate() (err error) {
 	defer func() {
 		err = markConfigValidationError(err)
 	}()
+	if err := validateAgentMemoryMaxMB(c.AgentMemoryMaxMB); err != nil {
+		return err
+	}
 	if err := validateReviewMCPAllowedTools(c.ReviewMCPAllowedTools); err != nil {
 		return err
 	}
@@ -755,6 +761,9 @@ func (c *Config) Validate() (err error) {
 		namedConfigValue{key: "fix_min_severity", value: c.FixMinSeverity},
 		namedConfigValue{key: "ci.min_severity", value: c.CI.MinSeverity},
 	); err != nil {
+		return err
+	}
+	if err := validateCICommentMinConfidence(c.CI.CommentMinConfidence); err != nil {
 		return err
 	}
 	if err := validateCICommentMaxFindings(c.CI.CommentMaxFindings); err != nil {
@@ -967,6 +976,9 @@ func (c *RepoConfig) Validate() (err error) {
 	if _, err := parsePostCommitQuietPeriod(c.PostCommitQuietPeriod); err != nil {
 		return err
 	}
+	if err := validateCICommentMinConfidence(c.CI.CommentMinConfidence); err != nil {
+		return err
+	}
 	if c.CI.CommentMaxFindings != nil && *c.CI.CommentMaxFindings < 0 {
 		return fmt.Errorf("ci.comment_max_findings must be non-negative")
 	}
@@ -1033,6 +1045,7 @@ func DefaultConfig() *Config {
 		OpenCodeCmd:        "opencode",
 		MuseCmd:            "muse",
 		GrokCmd:            "grok",
+		DroidCmd:           "droid",
 		MouseEnabled:       true,
 		Cost: CostConfig{
 			Timeout: "10s",
@@ -1114,10 +1127,17 @@ func LoadGlobalFrom(path string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := errors.Join(cfg.daemonErrs...); err != nil {
+	if err := errors.Join(errors.Join(cfg.daemonErrs...), validateAgentMemoryMaxMB(cfg.AgentMemoryMaxMB)); err != nil {
 		return nil, fmt.Errorf("config: %w", err)
 	}
 	return cfg, nil
+}
+
+func validateAgentMemoryMaxMB(mib int) error {
+	if mib < 0 {
+		return fmt.Errorf("agent_memory_max_mb must be 0 or more, got %d", mib)
+	}
+	return nil
 }
 
 // parseGlobalFrom decodes the global file and migrates deprecated keys.
@@ -1171,6 +1191,7 @@ func applyDaemonSections(c *Config) []error {
 		{"ci", func() error {
 			return errors.Join(
 				validateCICommentMaxFindings(c.CI.CommentMaxFindings),
+				validateCICommentMinConfidence(c.CI.CommentMinConfidence),
 				c.CI.NormalizeInstallations(),
 				validateCIPRFilters(c.CI),
 			)
@@ -1718,6 +1739,26 @@ func ResolveReuseReviewSessionLookbackFromConfig(
 func LoadRepoConfigFromRef(repoPath, ref string) (*RepoConfig, error) {
 	cfg, _, err := LoadRepoConfigFromRefWithRaw(repoPath, ref)
 	return cfg, err
+}
+
+// RepoCIReviewDefaultBranchAtRef reads only [ci] review_default_branch from
+// the .roborev.toml at ref, so an explicit setting is found even when other
+// settings in the file fail validation. It returns nil when the file or the
+// key is absent, or when the file is not valid TOML.
+func RepoCIReviewDefaultBranchAtRef(repoPath, ref string) *bool {
+	data, err := git.ReadFile(repoPath, ref, ".roborev.toml")
+	if err != nil {
+		return nil
+	}
+	var file struct {
+		CI struct {
+			ReviewDefaultBranch *bool `toml:"review_default_branch"`
+		} `toml:"ci"`
+	}
+	if _, err := toml.Decode(string(data), &file); err != nil {
+		return nil
+	}
+	return file.CI.ReviewDefaultBranch
 }
 
 // LoadRepoConfigFromRefWithRaw loads typed and raw repository configuration

@@ -1,5 +1,5 @@
 ---
-last_edited: 2026-11-06
+last_edited: 2026-11-17
 title: MCP Server
 description: Expose roborev review data to AI agents over the Model Context Protocol using stdio or streamable HTTP
 ---
@@ -21,6 +21,10 @@ metadata. The icon is a PNG data URI, so stdio and HTTP clients can load it
 without an external request. Whether it appears depends on the client.
 
 ## Install for coding agents
+
+Run `roborev agent setup --mcp` to connect Claude Code and Codex with MCP, or
+`roborev agent setup --print` for the manual `claude mcp add` and
+`codex mcp add` commands.
 
 `roborev mcp install` configures agents whose user configuration directories
 exist. Skills, Agent Hooks, and MCP installation support Claude Code, Codex,
@@ -186,6 +190,7 @@ bytes of JSON on November 6, 2026. `TestRegisteredToolsAndGuidance` enforces a
 
 | Tool | Purpose |
 |------|---------|
+| `roborev.skills` | List bundled how-to guides, or read one by its exact `name` |
 | `roborev_add_comment` | Add a comment with `job_id`, `commenter`, and `comment` |
 | `roborev_close_review` | Close an existing review by `job_id` |
 | `roborev_snooze` | Snooze or resume reminders using `repo_path`, `worktree_path`, `branch`, `enabled`, and an RFC3339 `snoozed_until` when enabled |
@@ -228,14 +233,37 @@ Unfiltered, empty multi-word lexical results with complete coverage include an
 `every_word_required` hint with `code` and `message`: “no review contains every
 word; search again with fewer words”.
 
-Errors are returned as tool errors with a stable `code` of `not_found`,
-`invalid_argument`, `unavailable`, or `internal`.
+Review-data and bookkeeping errors are returned as tool errors with a stable
+`code` of `not_found`, `invalid_argument`, `unavailable`, or `internal`.
+
+## Read bundled skills
+
+The server always exposes `roborev.skills` on both transports. No local skill
+installation is needed to discover or read its bundled guidance:
+
+```text
+roborev.skills {}
+roborev.skills {"name":"workflow"}
+roborev.skills {"name":"roborev-fix"}
+```
+
+The catalog lists `name`, `title`, and `summary` for `workflow` and the twelve
+shipped `roborev-*` skills. A named read returns the authored Markdown with its
+MCP adaptations as text content; structured content contains only the selected
+catalog entry. The workflow guide maps CLI operations to the actual MCP tools
+and explains which steps still need local CLI, Git, or code access.
+
+Names are exact and case-sensitive. Empty, null, unknown, or path-like names,
+wrong argument types, and extra fields return a tool error with guidance to list
+the available guides. This tool reads only shipped allowlisted guides. It does
+not load arbitrary files or execute a skill. Reading a guide does not satisfy
+its explicit invocation requirement or change a hook's supplied review scope.
 
 ## Guidance resource
 
 The server publishes a `roborev://mcp/guidance` Markdown resource describing the
 recommended call order: status, search, exact review detail, then responses as
-needed.
+needed. The same text is available through `roborev.skills {"name":"workflow"}`.
 
 ## Review links
 

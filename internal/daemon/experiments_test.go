@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"encoding/json/v2"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -25,6 +26,7 @@ func TestEnqueueSingleReviewPersistsExperiment(t *testing.T) {
 			Config: map[string]any{
 				"reuse_review_session": true,
 				"review_min_severity":  "high",
+				"review":               map[string]any{"binary_evidence": true},
 			},
 		},
 	}
@@ -53,6 +55,15 @@ func TestEnqueueSingleReviewPersistsExperiment(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, job.Branch, stored.Branch)
 	assert.Equal(t, job.Experiments, stored.Experiments)
+	assignment, err := db.GetExperimentAssignmentInputForJobUUID(*stored.UUID)
+	require.NoError(t, err)
+	require.NotNil(t, assignment)
+	var plan experimentJobPlan
+	require.NoError(t, json.Unmarshal([]byte(assignment.EffectiveConfigJSON), &plan))
+	assert.JSONEq(t, stored.PanelMemberConfigJSON, plan.PanelMemberConfigJSON)
+	var settings config.ReviewSettings
+	require.NoError(t, json.Unmarshal([]byte(stored.PanelMemberConfigJSON), &settings))
+	assert.True(t, settings.BinaryEvidence)
 
 	repo.CommitFile("review.go", "package review\n\nfunc changed() {}\n", "change review")
 	req = testutil.MakeJSONRequest(t, http.MethodPost, "/api/enqueue", EnqueueRequest{
@@ -285,6 +296,8 @@ func TestExperimentStandaloneRerunPreservesFrozenPlan(t *testing.T) {
 	enabled := true
 	ratio := 1.0
 	cfg := server.configWatcher.Config()
+	// Pair review_model with the job's agent so the experiment model applies.
+	cfg.ReviewAgent = "test"
 	cfg.Experiments = map[string]config.ExperimentDefinition{
 		"frozen-plan-v1": {
 			Enabled: &enabled, Ratio: &ratio,

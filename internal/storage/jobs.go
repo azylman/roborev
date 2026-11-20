@@ -77,6 +77,7 @@ type EnqueueOpts struct {
 	Branch              string
 	CIBaseBranch        string // PR base branch for CI event and hook matching
 	SessionID           string
+	SessionCLI          string
 	ResumeSourceJobUUID *uuid.UUID
 	Agent               string
 	Model               string // Effective model for this run
@@ -157,13 +158,15 @@ func (db *DB) EnqueueJob(opts EnqueueOpts) (*ReviewJob, error) {
 }
 
 // EnqueuePostCommitJob atomically inserts a hook-originated job unless a
-// non-canceled job already occupies the same (repo, ref, job type) key.
-func (db *DB) EnqueuePostCommitJob(opts EnqueueOpts) (*ReviewJob, bool, error) {
+// non-canceled job already occupies the same (repo, ref, job type) key. ctx
+// bounds the wait for the write lock: when the hook stops waiting, it keeps
+// the commit pending for its next run, so the insert is abandoned rather than
+// queued behind other writers to create a review the hook will request again.
+func (db *DB) EnqueuePostCommitJob(ctx context.Context, opts EnqueueOpts) (*ReviewJob, bool, error) {
 	opts.Source = JobSourcePostCommit
 	machineID, _ := db.GetMachineID()
 	now := time.Now()
 
-	ctx := context.Background()
 	conn, err := db.Conn(ctx)
 	if err != nil {
 		return nil, false, err
@@ -313,13 +316,13 @@ func (db *DB) insertJobTx(ctx context.Context, exec execer, opts EnqueueOpts, ui
 	}
 
 	result, err := exec.ExecContext(ctx, `
-		INSERT INTO review_jobs (repo_id, commit_id, git_ref, branch, ci_base_branch, session_id, session_resumed, resume_source_job_uuid, agent, model, provider, requested_model, requested_provider, reasoning,
+		INSERT INTO review_jobs (repo_id, commit_id, git_ref, branch, ci_base_branch, session_id, session_cli, session_resumed, resume_source_job_uuid, agent, model, provider, requested_model, requested_provider, reasoning,
 			status, job_type, review_type, patch_id, dirty_files, agentic, prompt_prebuilt, output_prefix,
 			parent_job_id, uuid, source_machine_id, updated_at, worktree_path, min_severity, backup_agent, backup_model,
 			panel_run_uuid, panel_role, panel_name, panel_member_name, panel_member_index, panel_member_config_json, non_voting, claim_blocked, source,
 			analysis_type, analysis_files, analysis_commit_sha)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		opts.RepoID, commitIDParam, gitRef, nullString(opts.Branch), nullString(opts.CIBaseBranch), nullString(opts.SessionID),
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		opts.RepoID, commitIDParam, gitRef, nullString(opts.Branch), nullString(opts.CIBaseBranch), nullString(opts.SessionID), nullString(opts.SessionCLI),
 		sessionResumedInt, opts.ResumeSourceJobUUID,
 		opts.Agent, nullString(opts.Model), nullString(opts.Provider), nullString(opts.RequestedModel), nullString(opts.RequestedProvider), reasoning,
 		jobType, opts.ReviewType, nullString(opts.PatchID),
@@ -348,6 +351,7 @@ func (db *DB) insertJobTx(ctx context.Context, exec execer, opts EnqueueOpts, ui
 		Branch:                opts.Branch,
 		CIBaseBranch:          opts.CIBaseBranch,
 		SessionID:             opts.SessionID,
+		SessionCLI:            opts.SessionCLI,
 		ResumeSourceJobUUID:   opts.ResumeSourceJobUUID,
 		Agent:                 opts.Agent,
 		Model:                 opts.Model,
@@ -403,9 +407,10 @@ func (db *DB) insertJobTx(ctx context.Context, exec execer, opts EnqueueOpts, ui
 // synthesis with job_type=synthesis, panel_role=synthesis, claim_blocked=1 — so
 // a caller that forgets the gate still cannot let the synthesis row be claimed
 // before its members run. On any insert error the whole run rolls back and no
-// rows persist.
+// rows persist. The older enqueue entry points below have no caller context;
+// request-aware enqueue passes its handler context into the shared transaction.
 func (db *DB) EnqueuePanelRun(members []EnqueueOpts, synthesis EnqueueOpts) ([]*ReviewJob, *ReviewJob, error) {
-	memberJobs, synthJob, _, err := db.enqueuePanelRun(members, synthesis, false, uuid.Nil(), 0)
+	memberJobs, synthJob, _, err := db.enqueuePanelRun(context.Background(), members, synthesis, false, uuid.Nil(), 0, nil)
 	return memberJobs, synthJob, err
 }
 
@@ -416,13 +421,14 @@ func (db *DB) EnqueuePanelRun(members []EnqueueOpts, synthesis EnqueueOpts) ([]*
 func (db *DB) EnqueuePanelRerun(
 	members []EnqueueOpts, synthesis EnqueueOpts, requestID uuid.UUID, sourceJobID int64,
 ) ([]*ReviewJob, *ReviewJob, bool, error) {
-	return db.enqueuePanelRun(members, synthesis, false, requestID, sourceJobID)
+	return db.enqueuePanelRun(context.Background(), members, synthesis, false, requestID, sourceJobID, nil)
 }
 
 // EnqueuePostCommitPanelRun atomically inserts a hook-originated panel unless
 // a non-canceled job already occupies the target member's deduplication key.
+// Like EnqueuePostCommitJob, ctx bounds the wait for the write lock.
 func (db *DB) EnqueuePostCommitPanelRun(
-	members []EnqueueOpts, synthesis EnqueueOpts,
+	ctx context.Context, members []EnqueueOpts, synthesis EnqueueOpts,
 ) ([]*ReviewJob, *ReviewJob, bool, error) {
 	if len(members) == 0 {
 		return nil, nil, false, errors.New("post-commit panel requires at least one member")
@@ -432,17 +438,17 @@ func (db *DB) EnqueuePostCommitPanelRun(
 		members[i].Source = JobSourcePostCommit
 	}
 	synthesis.Source = JobSourcePostCommit
-	return db.enqueuePanelRun(members, synthesis, true, uuid.Nil(), 0)
+	return db.enqueuePanelRun(ctx, members, synthesis, true, uuid.Nil(), 0, nil)
 }
 
 func (db *DB) enqueuePanelRun(
-	members []EnqueueOpts, synthesis EnqueueOpts, deduplicate bool,
+	ctx context.Context, members []EnqueueOpts, synthesis EnqueueOpts, deduplicate bool,
 	rerunRequestID uuid.UUID, rerunSourceJobID int64,
+	enqueueRequest *PanelEnqueueRequest,
 ) ([]*ReviewJob, *ReviewJob, bool, error) {
 	machineID, _ := db.GetMachineID()
 	now := time.Now()
 
-	ctx := context.Background()
 	conn, err := db.Conn(ctx)
 	if err != nil {
 		return nil, nil, false, err
@@ -460,6 +466,19 @@ func (db *DB) enqueuePanelRun(
 			}
 		}
 	}()
+	if enqueueRequest != nil {
+		job, found, err := lookupPanelEnqueueRequest(ctx, conn, *enqueueRequest)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		if found {
+			if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+				return nil, nil, false, err
+			}
+			committed = true
+			return nil, job, true, nil
+		}
+	}
 	if rerunRequestID != uuid.Nil() {
 		result, found, err := lookupRerunRequest(ctx, conn, rerunRequestID, rerunSourceJobID)
 		if err != nil {
@@ -519,6 +538,14 @@ func (db *DB) enqueuePanelRun(
 	memberJobs, synthJob, err := db.enqueuePanelRunTx(ctx, conn, members, synthesis, machineID, now)
 	if err != nil {
 		return nil, nil, false, err
+	}
+	if enqueueRequest != nil {
+		_, err := conn.ExecContext(ctx, `INSERT INTO panel_enqueue_requests
+ (request_id, request_hash, result_job_id, panel_run_uuid) VALUES (?, ?, ?, ?)`,
+			enqueueRequest.ID, enqueueRequest.Hash, synthJob.ID, synthJob.PanelRunUUID)
+		if err != nil {
+			return nil, nil, false, err
+		}
 	}
 	if rerunSourceJobID != 0 {
 		if err := rerunCIPanelTx(ctx, conn, rerunSourceJobID, synthJob, now); err != nil {
@@ -609,7 +636,14 @@ func (db *DB) ClaimJob(workerID string) (*ReviewJob, error) {
 // caller's context and the claim retry window both bound the operation. The
 // retry boundary owns a fresh connection and BEGIN IMMEDIATE transaction so
 // an interrupted SQLite statement cannot be retried on an invalid transaction.
+//
+// Idle workers poll often. A claim with no queued candidate returns before it
+// opens a write transaction, so polling never makes enqueues and other writers
+// wait for the write gate.
 func (db *DB) ClaimJobContext(ctx context.Context, workerID string) (*ReviewJob, error) {
+	if claimable, err := db.hasClaimableJob(ctx); err != nil || !claimable {
+		return nil, err
+	}
 	deadline := time.Now().Add(claimJobRetryWindow)
 	operationCtx, cancelOperation := context.WithDeadline(ctx, deadline)
 	defer cancelOperation()
@@ -617,6 +651,23 @@ func (db *DB) ClaimJobContext(ctx context.Context, workerID string) (*ReviewJob,
 	return retryOnSQLiteBusy(operationCtx, claimJobBusyAttempts, claimJobBusyAttemptTimeout, claimJobBusyBackoff, nil, func(attemptCtx context.Context) (*ReviewJob, error) {
 		return db.claimJobAttempt(attemptCtx, operationCtx, workerID)
 	})
+}
+
+// hasClaimableJob reports whether any queued job could be claimed now. It
+// applies the claim's cheap filters only, so a true result can still claim
+// nothing; a false result means the claim would find no candidate.
+func (db *DB) hasClaimableJob(ctx context.Context) (bool, error) {
+	var claimable bool
+	err := db.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM review_jobs
+			WHERE status = 'queued' AND claim_blocked = 0
+			  AND (retry_not_before IS NULL OR retry_not_before <= ?)
+		)`, preciseTimestampAt(time.Now())).Scan(&claimable)
+	if err != nil {
+		return false, fmt.Errorf("check for queued jobs: %w", err)
+	}
+	return claimable, nil
 }
 
 func (db *DB) claimJobAttempt(
@@ -834,8 +885,9 @@ func insertJobSessionHistory(
 }
 
 // RequeueUpdateInterruptedJob returns an update-interrupted attempt to the
-// queue without consuming a retry. The worker ownership guard prevents a stale
-// attempt from changing a row that was canceled or reclaimed concurrently.
+// queue without consuming a retry. A rebuttal keeps its input session. The
+// worker ownership guard prevents a stale attempt from changing a row that was
+// canceled or reclaimed concurrently.
 func (db *DB) RequeueUpdateInterruptedJob(
 	jobID int64, workerID string,
 ) (bool, error) {
@@ -844,15 +896,15 @@ func (db *DB) RequeueUpdateInterruptedJob(
 		SET status = 'queued',
 		    worker_id = NULL,
 		    started_at = NULL,
-		    session_id = NULL,
-		    session_resumed = 0,
+		    session_id = CASE WHEN source = ? THEN session_id ELSE NULL END,
+		    session_resumed = CASE WHEN source = ? THEN session_resumed ELSE 0 END,
 		    resume_source_job_uuid = NULL,
 		    token_usage = NULL,
 		    command_line = NULL,
 		    agent_invoked = 0,
 		    synced_at = NULL
 		WHERE id = ? AND status = 'running' AND worker_id = ?
-	`, jobID, workerID)
+	`, JobSourceRebuttal, JobSourceRebuttal, jobID, workerID)
 	if err != nil {
 		return false, err
 	}
@@ -989,6 +1041,91 @@ func (db *DB) IsolateJobSession(jobID int64, workerID string) error {
 	return nil
 }
 
+// ClearJobSessionID drops inherited resume metadata without isolating a fresh session.
+func (db *DB) ClearJobSessionID(jobID int64, workerID string) error {
+	result, err := db.Exec(`
+		UPDATE review_jobs
+		SET session_id = NULL, session_cli = NULL, session_resumed = 0,
+		    resume_source_job_uuid = NULL, updated_at = ?, synced_at = NULL
+		WHERE id = ? AND status = 'running' AND worker_id = ?
+	`, time.Now().Format(time.RFC3339), jobID, workerID)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// AssignRunningJobReusableSession assigns a compatible reusable session to a
+// running job (for example after failover switched the job to a backup agent)
+// only if no other running or unwinding-canceled job is currently using that
+// session. Returns true when the session was assigned.
+func (db *DB) AssignRunningJobReusableSession(
+	jobID int64, workerID, sessionID, sessionCLI string, resumeSourceJobUUID *uuid.UUID,
+) (bool, error) {
+	if sessionID == "" {
+		return false, nil
+	}
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer conn.Close()
+	if err := beginImmediate(ctx, conn); err != nil {
+		return false, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			if err := rollbackConn(conn); err != nil {
+				log.Printf("jobs AssignRunningJobReusableSession: rollback failed: %v", err)
+			}
+		}
+	}()
+
+	now := time.Now().Format(time.RFC3339)
+	result, err := conn.ExecContext(ctx, `
+		UPDATE review_jobs
+		SET session_id = ?, session_cli = NULLIF(?, ''), session_resumed = 1,
+		    resume_source_job_uuid = ?, updated_at = ?, synced_at = NULL
+		WHERE id = ?
+		  AND status = 'running'
+		  AND worker_id = ?
+		  AND (session_id IS NULL OR session_id = '')
+		  AND NOT EXISTS (
+		      SELECT 1 FROM review_jobs other
+		      WHERE (other.status = 'running'
+		             OR (other.status = 'canceled' AND COALESCE(other.worker_id, '') <> ''))
+		        AND other.id <> review_jobs.id
+		        AND other.session_id = ?
+		  )
+	`, sessionID, sessionCLI, resumeSourceJobUUID, now, jobID, workerID, sessionID)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if rows > 0 {
+		if err := insertJobSessionHistory(ctx, conn, jobID); err != nil {
+			return false, err
+		}
+	}
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return false, err
+	}
+	committed = true
+	return rows > 0, nil
+}
+
 // SaveJobSessionID stores the captured agent session ID for a job.
 // The first captured ID wins so repeated lifecycle events do not
 // overwrite it. The update is scoped to the current execution
@@ -997,6 +1134,15 @@ func (db *DB) IsolateJobSession(jobID int64, workerID string) error {
 // a session ID that belongs to a new attempt of the same job.
 func (db *DB) SaveJobSessionID(
 	jobID int64, workerID, sessionID string,
+) error {
+	return db.SaveJobSessionIDWithCLI(jobID, workerID, sessionID, "")
+}
+
+// SaveJobSessionIDWithCLI stores the session ID and the CLI that created it.
+// The CLI reports a different ID only for a new conversation, so that ID
+// replaces the stored one.
+func (db *DB) SaveJobSessionIDWithCLI(
+	jobID int64, workerID, sessionID, sessionCLI string,
 ) error {
 	if sessionID == "" {
 		return nil
@@ -1022,12 +1168,13 @@ func (db *DB) SaveJobSessionID(
 	now := time.Now().Format(time.RFC3339)
 	result, err := conn.ExecContext(ctx, `
 		UPDATE review_jobs
-		SET session_id = ?, updated_at = ?
+		SET session_id = ?, session_cli = NULLIF(?, ''), session_resumed = 0,
+		    resume_source_job_uuid = NULL, updated_at = ?
 		WHERE id = ?
 		  AND status = 'running'
 		  AND worker_id = ?
-		  AND (session_id IS NULL OR session_id = '')
-	`, sessionID, now, jobID, workerID)
+		  AND (session_id IS NULL OR session_id = '' OR (? != '' AND session_id != ?))
+	`, sessionID, sessionCLI, now, jobID, workerID, sessionCLI, sessionID)
 	if err != nil {
 		return err
 	}
@@ -1481,6 +1628,26 @@ func (db *DB) failJob(ctx context.Context, jobID int64, errorMsg, predicate stri
 	now := finished.Format(time.RFC3339)
 	args := append([]any{preciseTimestampAt(finished), errorMsg, now, jobID}, attemptArgs...)
 	result, err := db.ExecContext(ctx, `UPDATE review_jobs SET status = 'failed', finished_at = ?, error = ?, updated_at = ? WHERE id = ? AND status = 'running'`+predicate, args...)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
+}
+
+// SkipJob ends the worker's running attempt as skipped, with a reason. A
+// skipped review ran no agent and has no verdict. It reports whether the job
+// was still running on that worker.
+func (db *DB) SkipJob(ctx context.Context, jobID int64, workerID, reason string) (bool, error) {
+	finished := time.Now()
+	result, err := db.ExecContext(ctx, `
+		UPDATE review_jobs
+		SET status = 'skipped', skip_reason = ?, finished_at = ?, updated_at = ?
+		WHERE id = ? AND status = 'running' AND worker_id = ?
+	`, sanitizeSkipReason(reason), preciseTimestampAt(finished), finished.Format(time.RFC3339), jobID, workerID)
 	if err != nil {
 		return false, err
 	}
@@ -2253,12 +2420,13 @@ func buildJobFilterClause(statusFilter, repoFilter string, o listJobsOptions, en
 			} else {
 				conditions = append(conditions, "(rv.closed IS NULL OR rv.closed = 0)")
 			}
-			// Failed and canceled jobs never produce a review to resolve, so
-			// they are not open. An explicit status filter wins: asking for
-			// failed jobs with the open filter on must still list them.
+			// Failed, canceled, and skipped jobs never produce a review to
+			// resolve, so they are not open. An explicit status filter wins:
+			// asking for failed jobs with the open filter on must still list
+			// them.
 			if statusFilter == "" {
-				conditions = append(conditions, "j.status NOT IN (?, ?)")
-				args = append(args, JobStatusFailed, JobStatusCanceled)
+				conditions = append(conditions, "j.status NOT IN (?, ?, ?)")
+				args = append(args, JobStatusFailed, JobStatusCanceled, JobStatusSkipped)
 			}
 		}
 	}
